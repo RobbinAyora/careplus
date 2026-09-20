@@ -1,8 +1,8 @@
 {
+  "/_not-found/page": "app/_not-found/page.js",
   "/page": "app/page.js",
-  "/(dashboard)/hospital-admin/dashboard/page": "app/(dashboard)/hospital-admin/dashboard/page.js",
-  "/(dashboard)/nurse/dashboard/page": "app/(dashboard)/nurse/dashboard/page.js",
   "/(dashboard)/doctor/dashboard/page": "app/(dashboard)/doctor/dashboard/page.js",
+  "/(dashboard)/doctor/patients/page": "app/(dashboard)/doctor/patients/page.js",
   "/(dashboard)/doctor/appointments/page": "app/(dashboard)/doctor/appointments/page.js",
-  "/(dashboard)/receptionist/dashboard/page": "app/(dashboard)/receptionist/dashboard/page.js"
+  "/(dashboard)/doctor/patients/[patientId]/page": "app/(dashboard)/doctor/patients/[patientId]/page.js"
 }
