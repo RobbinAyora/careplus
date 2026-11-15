@@ -1,7 +1,6 @@
-
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ChevronDown,
   Grid2X2,
@@ -9,11 +8,16 @@ import {
   Plus,
   Search,
   SlidersHorizontal,
+  Clock,
+  Users,
+  UserCheck,
+  Activity,
+  Stethoscope,
+  CheckCircle2,
 } from "lucide-react";
 
 import PatientTable from "@/components/dashboard/doctor/patients/PatientTable";
 import PatientCard from "@/components/dashboard/doctor/patients/PatientCard";
-import { mockPatients } from "@/lib/patients/mock-patients";
 import type {
   Gender,
   Patient,
@@ -23,29 +27,690 @@ import type {
 type ViewMode = "table" | "grid";
 type SortMode = "recent" | "alphabetical" | "flagged";
 
-const CURRENT_DOCTOR_ID = "DOC-001";
+type AvailabilityStatus =
+  | "AVAILABLE"
+  | "ON_BREAK"
+  | "OFF_DUTY";
+
+interface DoctorWorkload {
+  waitingPatients: number;
+  patientsInConsultation: number;
+  currentWorkload: number;
+  maxPatients: number;
+  remainingCapacity: number;
+}
+
+interface DoctorProfileData {
+  availabilityStatus: AvailabilityStatus;
+  department: string | null;
+  workload: DoctorWorkload;
+}
+
+interface ApiErrorResponse {
+  message?: string | string[];
+}
+
+interface AssignedPatientsPagination {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
+const SESSION_KEY = "careplus.auth-session";
+const PAGE_SIZE = 20;
+
+const DEFAULT_WORKLOAD: DoctorWorkload = {
+  waitingPatients: 0,
+  patientsInConsultation: 0,
+  currentWorkload: 0,
+  maxPatients: 0,
+  remainingCapacity: 0,
+};
+
+const DEFAULT_PAGINATION: AssignedPatientsPagination = {
+  page: 1,
+  limit: PAGE_SIZE,
+  total: 0,
+  totalPages: 1,
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function getNumber(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : fallback;
+}
+
+function getString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function getAvailabilityStatus(
+  value: unknown,
+): AvailabilityStatus | null {
+  if (
+    value === "AVAILABLE" ||
+    value === "ON_BREAK" ||
+    value === "OFF_DUTY"
+  ) {
+    return value;
+  }
+
+  return null;
+}
+
+function getApiError(data: unknown, fallback: string): string {
+  if (!isRecord(data)) return fallback;
+
+  const message = (data as ApiErrorResponse).message;
+
+  if (typeof message === "string") return message;
+
+  if (Array.isArray(message)) {
+    return message.join(", ");
+  }
+
+  return fallback;
+}
+
+function parseDoctorProfile(data: unknown): DoctorProfileData {
+  if (!isRecord(data)) {
+    throw new Error("The server returned an invalid doctor profile.");
+  }
+
+  const profile = isRecord(data.doctorProfile)
+    ? data.doctorProfile
+    : isRecord(data.profile)
+      ? data.profile
+      : data;
+
+  const workload = isRecord(data.workload)
+    ? data.workload
+    : profile;
+
+  const availabilityStatus = getAvailabilityStatus(
+    profile.availabilityStatus ?? data.availabilityStatus,
+  );
+
+  if (!availabilityStatus) {
+    throw new Error(
+      "The doctor availability status was missing or invalid in the server response.",
+    );
+  }
+
+  const waitingPatients = getNumber(workload.waitingPatients);
+
+  const patientsInConsultation = getNumber(
+    workload.patientsInConsultation,
+  );
+
+  const currentWorkload = getNumber(
+    workload.currentWorkload,
+    waitingPatients + patientsInConsultation,
+  );
+
+  const maxPatients = getNumber(
+    workload.maxPatients,
+    getNumber(profile.maxPatients),
+  );
+
+  const remainingCapacity = getNumber(
+    workload.remainingCapacity,
+    Math.max(0, maxPatients - currentWorkload),
+  );
+
+  return {
+    availabilityStatus,
+    department:
+      typeof profile.department === "string"
+        ? profile.department
+        : null,
+    workload: {
+      waitingPatients,
+      patientsInConsultation,
+      currentWorkload,
+      maxPatients,
+      remainingCapacity,
+    },
+  };
+}
+
+/**
+ * Calculates a patient's age from their date of birth.
+ */
+function calculateAge(dateOfBirth: unknown): number {
+  if (typeof dateOfBirth !== "string") return 0;
+
+  const date = new Date(dateOfBirth);
+
+  if (Number.isNaN(date.getTime())) return 0;
+
+  const today = new Date();
+
+  let age = today.getFullYear() - date.getFullYear();
+
+  const monthDifference = today.getMonth() - date.getMonth();
+
+  if (
+    monthDifference < 0 ||
+    (monthDifference === 0 && today.getDate() < date.getDate())
+  ) {
+    age--;
+  }
+
+  return Math.max(0, age);
+}
+
+/**
+ * Converts the backend's sex/gender values into the values
+ * expected by the existing Patient components.
+ */
+function parseGender(value: unknown): Gender {
+  const normalized = String(value ?? "").toUpperCase();
+
+  if (normalized === "MALE") return "Male";
+  if (normalized === "FEMALE") return "Female";
+
+  return "Male";
+}
+
+/**
+ * Converts the backend visit information into the existing
+ * frontend Patient structure.
+ */
+function mapAssignedPatient(queueEntry: unknown): Patient {
+  if (!isRecord(queueEntry)) {
+    throw new Error("The server returned an invalid patient record.");
+  }
+
+  const visit = isRecord(queueEntry.visit)
+    ? queueEntry.visit
+    : queueEntry;
+
+  const patient = isRecord(visit.patient)
+    ? visit.patient
+    : isRecord(queueEntry.patient)
+      ? queueEntry.patient
+      : {};
+
+  const triageRecord = isRecord(visit.triageRecord)
+    ? visit.triageRecord
+    : isRecord(queueEntry.triageRecord)
+      ? queueEntry.triageRecord
+      : {};
+
+  const assignedDoctor = isRecord(queueEntry.assignedDoctor)
+    ? queueEntry.assignedDoctor
+    : {};
+
+  const firstName = getString(patient.firstName);
+  const lastName = getString(patient.lastName);
+  const otherNames = getString(patient.otherNames);
+
+  const fullName = [firstName, otherNames, lastName]
+    .filter(Boolean)
+    .join(" ");
+
+  const dateOfBirth = patient.dateOfBirth;
+
+  const visitType = getString(visit.visitType).toUpperCase();
+
+  const visitStatus = getString(
+    queueEntry.status ?? visit.status,
+  ).toUpperCase();
+
+  // The current doctor queue contains patients awaiting consultation
+  // or already in consultation. Visit type determines the existing
+  // frontend's outpatient/admitted display status.
+  const patientStatus: PatientStatus =
+    visitType === "INPATIENT" ? "Admitted" : "Outpatient";
+
+  const priority = getString(triageRecord.priority).toUpperCase();
+
+  const allergies = Array.isArray(triageRecord.allergies)
+    ? triageRecord.allergies.filter(
+        (item): item is string => typeof item === "string",
+      )
+    : [];
+
+  const medications = Array.isArray(
+    triageRecord.currentMedications,
+  )
+    ? triageRecord.currentMedications.filter(
+        (item): item is string => typeof item === "string",
+      )
+    : [];
+
+  const patientId = getString(patient.id);
+
+  return {
+    id: patientId,
+    name: fullName || "Unnamed Patient",
+    age: calculateAge(dateOfBirth),
+    gender: parseGender(patient.sex ?? patient.gender),
+    phone: getString(patient.phone),
+    email: getString(patient.email),
+    avatar: getString(patient.avatar),
+    status: patientStatus,
+    doctor: [
+      getString(assignedDoctor.firstName),
+      getString(assignedDoctor.lastName),
+    ]
+      .filter(Boolean)
+      .join(" ") || "Assigned Doctor",
+    ward: getString(visit.ward),
+    bed: getString(visit.bed),
+    lastVisit: getString(
+      visit.createdAt ?? queueEntry.checkedInAt,
+    ),
+    nextAppointment: "",
+    insurance: getString(patient.insuranceType),
+    allergies,
+    chronicConditions: [],
+    flagged:
+      priority === "EMERGENCY" ||
+      priority === "URGENT" ||
+      visitStatus === "REFERRED",
+
+    // Used by the existing patient filtering logic if this
+    // property is present in your Patient type.
+    assignedDoctorId: getString(queueEntry.assignedDoctorId),
+  } as Patient;
+}
+
+/**
+ * Extracts the patient records from the API response.
+ *
+ * Supports the common response structures:
+ * { data: [], pagination: {} }
+ * { items: [], pagination: {} }
+ * { results: [], pagination: {} }
+ */
+function parseAssignedPatientsResponse(data: unknown): {
+  patients: Patient[];
+  pagination: AssignedPatientsPagination;
+} {
+  if (!isRecord(data)) {
+    throw new Error("The server returned an invalid patients response.");
+  }
+
+  let records: unknown[] = [];
+
+  if (Array.isArray(data.data)) {
+    records = data.data;
+  } else if (Array.isArray(data.items)) {
+    records = data.items;
+  } else if (Array.isArray(data.results)) {
+    records = data.results;
+  } else if (Array.isArray(data.queueEntries)) {
+    records = data.queueEntries;
+  }
+
+  const paginationSource = isRecord(data.pagination)
+    ? data.pagination
+    : isRecord(data.meta)
+      ? data.meta
+      : data;
+
+  const page = getNumber(
+    paginationSource.page,
+    DEFAULT_PAGINATION.page,
+  );
+
+  const limit = getNumber(
+    paginationSource.limit,
+    DEFAULT_PAGINATION.limit,
+  );
+
+  const total = getNumber(
+    paginationSource.total,
+    records.length,
+  );
+
+  const totalPages = getNumber(
+    paginationSource.totalPages,
+    Math.max(1, Math.ceil(total / limit)),
+  );
+
+  return {
+    patients: records.map(mapAssignedPatient),
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, totalPages),
+    },
+  };
+}
 
 export default function DoctorPatientsPage() {
   const [search, setSearch] = useState("");
-  const [scope, setScope] = useState<"mine" | "all">("mine");
+
   const [status, setStatus] = useState<PatientStatus | "All">("All");
   const [gender, setGender] = useState<Gender | "All">("All");
   const [ageRange, setAgeRange] = useState("All");
+
   const [sort, setSort] = useState<SortMode>("recent");
   const [view, setView] = useState<ViewMode>("table");
   const [page, setPage] = useState(1);
 
-  const PAGE_SIZE = 20;
+  // DOCTOR AVAILABILITY STATE
+
+  const [availability, setAvailability] =
+    useState<AvailabilityStatus>("OFF_DUTY");
+
+  const [showAvailabilityOptions, setShowAvailabilityOptions] =
+    useState(false);
+
+  // BACKEND INTEGRATION STATE
+
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+
+  const [profileLoading, setProfileLoading] = useState(true);
+  const [availabilitySaving, setAvailabilitySaving] = useState(false);
+
+  const [patientsLoading, setPatientsLoading] = useState(true);
+
+  const [apiError, setApiError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  const [department, setDepartment] = useState<string | null>(null);
+
+  const [workload, setWorkload] =
+    useState<DoctorWorkload>(DEFAULT_WORKLOAD);
+
+  // BACKEND PATIENT DATA
+
+  const [assignedPatients, setAssignedPatients] = useState<Patient[]>([]);
+
+  const [pagination, setPagination] =
+    useState<AssignedPatientsPagination>(DEFAULT_PAGINATION);
+
+  const waitingPatients = workload.waitingPatients;
+  const patientsInConsultation = workload.patientsInConsultation;
+  const currentWorkload = workload.currentWorkload;
+  const maxPatients = workload.maxPatients;
+  const remainingCapacity = workload.remainingCapacity;
+
+  // API URL
+
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "");
+
+  // LOAD DOCTOR PROFILE FROM BACKEND
+
+  const loadDoctorProfile = useCallback(
+    async (token: string) => {
+      if (!apiUrl) {
+        setApiError("The API address is not configured.");
+        setProfileLoading(false);
+        return;
+      }
+
+      try {
+        const response = await fetch(
+          `${apiUrl}/doctors/me/profile`,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
+            cache: "no-store",
+          },
+        );
+
+        const data: unknown = await response.json();
+
+        if (!response.ok) {
+          throw new Error(
+            getApiError(
+              data,
+              "Unable to load your doctor profile.",
+            ),
+          );
+        }
+
+        const profile = parseDoctorProfile(data);
+
+        setAvailability(profile.availabilityStatus);
+        setDepartment(profile.department);
+        setWorkload(profile.workload);
+      } catch (error) {
+        setApiError(
+          error instanceof Error
+            ? error.message
+            : "Unable to load your doctor profile.",
+        );
+      } finally {
+        setProfileLoading(false);
+      }
+    },
+    [apiUrl],
+  );
+
+  // LOAD ASSIGNED PATIENTS FROM BACKEND
+
+  const loadAssignedPatients = useCallback(
+    async (token: string, currentPage: number, searchTerm: string) => {
+      if (!apiUrl) {
+        setApiError("The API address is not configured.");
+        setPatientsLoading(false);
+        return;
+      }
+
+      setPatientsLoading(true);
+
+      try {
+        const queryParams = new URLSearchParams({
+          page: String(currentPage),
+          limit: String(PAGE_SIZE),
+        });
+
+        if (searchTerm.trim()) {
+          queryParams.set("search", searchTerm.trim());
+        }
+
+        const response = await fetch(
+          `${apiUrl}/doctors/me/assigned-patients?${queryParams.toString()}`,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
+            cache: "no-store",
+          },
+        );
+
+        const data: unknown = await response.json();
+
+        if (!response.ok) {
+          throw new Error(
+            getApiError(
+              data,
+              "Unable to load your assigned patients.",
+            ),
+          );
+        }
+
+        const result = parseAssignedPatientsResponse(data);
+
+        setAssignedPatients(result.patients);
+        setPagination(result.pagination);
+      } catch (error) {
+        setAssignedPatients([]);
+
+        setApiError(
+          error instanceof Error
+            ? error.message
+            : "Unable to load your assigned patients.",
+        );
+      } finally {
+        setPatientsLoading(false);
+      }
+    },
+    [apiUrl],
+  );
+
+  // GET TOKEN FROM EXISTING AUTH SESSION
+
+  useEffect(() => {
+    try {
+      const storedSession =
+        window.sessionStorage.getItem(SESSION_KEY);
+
+      if (!storedSession) {
+        setApiError(
+          "Your session has expired. Please sign in again.",
+        );
+
+        setProfileLoading(false);
+        setPatientsLoading(false);
+        return;
+      }
+
+      const parsed: unknown = JSON.parse(storedSession);
+
+      if (
+        !isRecord(parsed) ||
+        typeof parsed.accessToken !== "string" ||
+        !parsed.accessToken
+      ) {
+        setApiError(
+          "Your authentication session is invalid. Please sign in again.",
+        );
+
+        setProfileLoading(false);
+        setPatientsLoading(false);
+        return;
+      }
+
+      setAccessToken(parsed.accessToken);
+
+      void loadDoctorProfile(parsed.accessToken);
+    } catch {
+      setApiError("Unable to read your authentication session.");
+      setProfileLoading(false);
+      setPatientsLoading(false);
+    }
+  }, [loadDoctorProfile]);
+
+  // FETCH ASSIGNED PATIENTS WHEN TOKEN, PAGE OR SEARCH CHANGES
+
+  useEffect(() => {
+    if (!accessToken) return;
+
+    void loadAssignedPatients(accessToken, page, search);
+  }, [accessToken, page, search, loadAssignedPatients]);
+
+  // UPDATE DOCTOR AVAILABILITY
+
+  async function handleAvailabilityChange(
+    newAvailability: AvailabilityStatus,
+  ) {
+    if (!accessToken || !apiUrl) {
+      setApiError(
+        "Your session is unavailable. Please sign in again.",
+      );
+      return;
+    }
+
+    if (newAvailability === availability) {
+      setShowAvailabilityOptions(false);
+      return;
+    }
+
+    setAvailabilitySaving(true);
+    setApiError(null);
+    setSuccessMessage(null);
+    setShowAvailabilityOptions(false);
+
+    try {
+      const response = await fetch(
+        `${apiUrl}/doctors/me/availability`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            availabilityStatus: newAvailability,
+          }),
+        },
+      );
+
+      const data: unknown = await response.json();
+
+      if (!response.ok) {
+        throw new Error(
+          getApiError(
+            data,
+            "Unable to update your availability.",
+          ),
+        );
+      }
+
+      await loadDoctorProfile(accessToken);
+
+      setSuccessMessage(
+        "Your availability has been updated successfully.",
+      );
+    } catch (error) {
+      setApiError(
+        error instanceof Error
+          ? error.message
+          : "Unable to update your availability.",
+      );
+    } finally {
+      setAvailabilitySaving(false);
+    }
+  }
+
+  // AVAILABILITY OPTIONS
+
+  const availabilityOptions: {
+    value: AvailabilityStatus;
+    label: string;
+    description: string;
+    color: string;
+    dotColor: string;
+  }[] = [
+    {
+      value: "AVAILABLE",
+      label: "Available",
+      description: "You can receive new patients",
+      color: "text-emerald-700 bg-emerald-50 border-emerald-200",
+      dotColor: "bg-emerald-500",
+    },
+    {
+      value: "ON_BREAK",
+      label: "On Break",
+      description: "Temporarily unavailable",
+      color: "text-amber-700 bg-amber-50 border-amber-200",
+      dotColor: "bg-amber-500",
+    },
+    {
+      value: "OFF_DUTY",
+      label: "Off Duty",
+      description: "Not receiving new patients",
+      color: "text-slate-600 bg-slate-100 border-slate-200",
+      dotColor: "bg-slate-400",
+    },
+  ];
+
+  const currentAvailability = availabilityOptions.find(
+    (option) => option.value === availability,
+  )!;
+
+  // FILTER AND SORT BACKEND PATIENTS
 
   const filteredPatients = useMemo(() => {
-    let result = [...mockPatients];
-
-    if (scope === "mine") {
-      result = result.filter(
-        (patient) =>
-          patient.assignedDoctorId === CURRENT_DOCTOR_ID,
-      );
-    }
+    let result = [...assignedPatients];
 
     if (status !== "All") {
       result = result.filter(
@@ -62,34 +727,23 @@ export default function DoctorPatientsPage() {
     if (ageRange !== "All") {
       result = result.filter((patient) => {
         if (ageRange === "0-17") return patient.age <= 17;
-        if (ageRange === "18-35")
+
+        if (ageRange === "18-35") {
           return patient.age >= 18 && patient.age <= 35;
-        if (ageRange === "36-55")
+        }
+
+        if (ageRange === "36-55") {
           return patient.age >= 36 && patient.age <= 55;
+        }
+
         if (ageRange === "56+") return patient.age >= 56;
 
         return true;
       });
     }
 
-    const query = search.trim().toLowerCase();
-
-    if (query) {
-      result = result.filter((patient) =>
-        [
-          patient.name,
-          patient.id,
-          patient.phone,
-        ].some((value) =>
-          value.toLowerCase().includes(query),
-        ),
-      );
-    }
-
     if (sort === "alphabetical") {
-      result.sort((a, b) =>
-        a.name.localeCompare(b.name),
-      );
+      result.sort((a, b) => a.name.localeCompare(b.name));
     }
 
     if (sort === "flagged") {
@@ -116,23 +770,16 @@ export default function DoctorPatientsPage() {
 
     return result;
   }, [
-    search,
-    scope,
+    assignedPatients,
     status,
     gender,
     ageRange,
     sort,
   ]);
 
-  const totalPages = Math.max(
-    1,
-    Math.ceil(filteredPatients.length / PAGE_SIZE),
-  );
+  const totalPages = pagination.totalPages;
 
-  const visiblePatients = filteredPatients.slice(
-    (page - 1) * PAGE_SIZE,
-    page * PAGE_SIZE,
-  );
+  const visiblePatients = filteredPatients;
 
   function handleSearch(value: string) {
     setSearch(value);
@@ -166,6 +813,229 @@ export default function DoctorPatientsPage() {
         </button>
       </div>
 
+      {/* DOCTOR AVAILABILITY */}
+
+      <section className="mt-6 rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)] sm:p-6">
+        <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50">
+                <Stethoscope className="h-5 w-5 text-blue-600" />
+              </div>
+
+              <div>
+                <h2 className="font-bold text-[#102a56]">
+                  Doctor Availability
+                </h2>
+
+                <p className="mt-0.5 text-xs text-slate-400">
+                  Manage your availability to receive patients.
+                </p>
+              </div>
+            </div>
+
+            {department && (
+              <p className="mt-3 text-xs font-medium text-slate-500">
+                Department: {department}
+              </p>
+            )}
+          </div>
+
+          {/* AVAILABILITY SELECTOR */}
+
+          <div className="relative">
+            <button
+              type="button"
+              disabled={
+                profileLoading ||
+                availabilitySaving ||
+                !accessToken
+              }
+              onClick={() =>
+                setShowAvailabilityOptions(
+                  !showAvailabilityOptions,
+                )
+              }
+              className={`flex w-full items-center justify-between gap-5 rounded-xl border px-4 py-3 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 sm:min-w-[220px] ${currentAvailability.color}`}
+            >
+              <span className="flex items-center gap-2">
+                <span
+                  className={`h-2.5 w-2.5 rounded-full ${currentAvailability.dotColor}`}
+                />
+
+                <span className="text-sm font-semibold">
+                  {profileLoading
+                    ? "Loading..."
+                    : availabilitySaving
+                      ? "Updating..."
+                      : currentAvailability.label}
+                </span>
+              </span>
+
+              <ChevronDown className="h-4 w-4" />
+            </button>
+
+            {showAvailabilityOptions && (
+              <div className="absolute right-0 z-30 mt-2 w-full overflow-hidden rounded-xl border border-blue-100 bg-white p-1 shadow-xl">
+                {availabilityOptions.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    disabled={availabilitySaving}
+                    onClick={() =>
+                      void handleAvailabilityChange(option.value)
+                    }
+                    className="flex w-full items-start gap-3 rounded-lg px-3 py-3 text-left transition hover:bg-blue-50 disabled:opacity-50"
+                  >
+                    <span
+                      className={`mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full ${option.dotColor}`}
+                    />
+
+                    <span className="flex-1">
+                      <span className="block text-sm font-semibold text-[#102a56]">
+                        {option.label}
+                      </span>
+
+                      <span className="mt-0.5 block text-xs text-slate-400">
+                        {option.description}
+                      </span>
+                    </span>
+
+                    {availability === option.value && (
+                      <CheckCircle2 className="h-4 w-4 text-blue-600" />
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* AVAILABILITY DESCRIPTION */}
+
+        <div className="mt-5 flex items-center gap-3 rounded-xl bg-slate-50 px-4 py-3">
+          <span
+            className={`h-2.5 w-2.5 rounded-full ${currentAvailability.dotColor}`}
+          />
+
+          <p className="text-sm text-slate-600">
+            {profileLoading
+              ? "Loading your availability..."
+              : currentAvailability.description + "."}
+          </p>
+        </div>
+
+        {/* API SUCCESS MESSAGE */}
+
+        {successMessage && (
+          <div className="mt-3 rounded-xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+            {successMessage}
+          </div>
+        )}
+
+        {/* API ERROR MESSAGE */}
+
+        {apiError && (
+          <div className="mt-3 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {apiError}
+          </div>
+        )}
+      </section>
+
+      {/* DOCTOR WORKLOAD STATISTICS */}
+
+      <section className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {/* WAITING PATIENTS */}
+
+        <div className="rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
+          <div className="flex items-center justify-between">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-50">
+              <Users className="h-5 w-5 text-blue-600" />
+            </div>
+
+            <span className="text-xs font-medium text-slate-400">
+              Waiting
+            </span>
+          </div>
+
+          <p className="mt-4 text-2xl font-bold text-[#102a56]">
+            {profileLoading ? "..." : waitingPatients}
+          </p>
+
+          <p className="mt-1 text-xs text-slate-400">
+            Patients awaiting consultation
+          </p>
+        </div>
+
+        {/* IN CONSULTATION */}
+
+        <div className="rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
+          <div className="flex items-center justify-between">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-50">
+              <Activity className="h-5 w-5 text-indigo-600" />
+            </div>
+
+            <span className="text-xs font-medium text-slate-400">
+              Active
+            </span>
+          </div>
+
+          <p className="mt-4 text-2xl font-bold text-[#102a56]">
+            {profileLoading ? "..." : patientsInConsultation}
+          </p>
+
+          <p className="mt-1 text-xs text-slate-400">
+            Patients in consultation
+          </p>
+        </div>
+
+        {/* MAXIMUM CAPACITY */}
+
+        <div className="rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
+          <div className="flex items-center justify-between">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-50">
+              <Clock className="h-5 w-5 text-amber-600" />
+            </div>
+
+            <span className="text-xs font-medium text-slate-400">
+              Capacity
+            </span>
+          </div>
+
+          <p className="mt-4 text-2xl font-bold text-[#102a56]">
+            {profileLoading
+              ? "..."
+              : `${currentWorkload}/${maxPatients}`}
+          </p>
+
+          <p className="mt-1 text-xs text-slate-400">
+            Current patient workload
+          </p>
+        </div>
+
+        {/* AVAILABLE SLOTS */}
+
+        <div className="rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
+          <div className="flex items-center justify-between">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-50">
+              <UserCheck className="h-5 w-5 text-emerald-600" />
+            </div>
+
+            <span className="text-xs font-medium text-slate-400">
+              Remaining
+            </span>
+          </div>
+
+          <p className="mt-4 text-2xl font-bold text-[#102a56]">
+            {profileLoading ? "..." : remainingCapacity}
+          </p>
+
+          <p className="mt-1 text-xs text-slate-400">
+            Available patient slots
+          </p>
+        </div>
+      </section>
+
       {/* SEARCH + SCOPE */}
 
       <div className="mt-6 rounded-2xl border border-blue-50 bg-white p-4 shadow-[0_4px_20px_rgba(37,99,235,0.04)] sm:p-5">
@@ -187,30 +1057,16 @@ export default function DoctorPatientsPage() {
           <div className="flex rounded-xl bg-slate-50 p-1">
             <button
               type="button"
-              onClick={() => {
-                setScope("mine");
-                setPage(1);
-              }}
-              className={`rounded-lg px-5 py-2.5 text-sm font-semibold transition ${
-                scope === "mine"
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-slate-500 hover:text-[#102a56]"
-              }`}
+              className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm"
             >
               My Patients
             </button>
 
             <button
               type="button"
-              onClick={() => {
-                setScope("all");
-                setPage(1);
-              }}
-              className={`rounded-lg px-5 py-2.5 text-sm font-semibold transition ${
-                scope === "all"
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-slate-500 hover:text-[#102a56]"
-              }`}
+              disabled
+              title="Doctors can only view patients assigned to them."
+              className="cursor-not-allowed rounded-lg px-5 py-2.5 text-sm font-semibold text-slate-300"
             >
               All Patients
             </button>
@@ -225,11 +1081,8 @@ export default function DoctorPatientsPage() {
               value={status}
               onChange={(event) => {
                 setStatus(
-                  event.target.value as
-                    | PatientStatus
-                    | "All",
+                  event.target.value as PatientStatus | "All",
                 );
-                setPage(1);
               }}
               className="appearance-none rounded-lg border border-blue-100 bg-white py-2.5 pl-3 pr-9 text-xs font-medium text-[#54709c] outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50"
             >
@@ -249,7 +1102,6 @@ export default function DoctorPatientsPage() {
                 setGender(
                   event.target.value as Gender | "All",
                 );
-                setPage(1);
               }}
               className="appearance-none rounded-lg border border-blue-100 bg-white py-2.5 pl-3 pr-9 text-xs font-medium text-[#54709c] outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50"
             >
@@ -266,7 +1118,6 @@ export default function DoctorPatientsPage() {
               value={ageRange}
               onChange={(event) => {
                 setAgeRange(event.target.value);
-                setPage(1);
               }}
               className="appearance-none rounded-lg border border-blue-100 bg-white py-2.5 pl-3 pr-9 text-xs font-medium text-[#54709c] outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50"
             >
@@ -318,13 +1169,13 @@ export default function DoctorPatientsPage() {
         <div className="flex items-center justify-between border-b border-blue-50 px-5 py-4 sm:px-6">
           <div>
             <h2 className="font-bold text-[#102a56]">
-              {scope === "mine"
-                ? "My Patients"
-                : "All Patients"}
+              My Patients
             </h2>
 
             <p className="mt-1 text-xs text-slate-400">
-              {filteredPatients.length} patients found
+              {patientsLoading
+                ? "Loading assigned patients..."
+                : `${pagination.total} assigned patients found`}
             </p>
           </div>
 
@@ -357,7 +1208,15 @@ export default function DoctorPatientsPage() {
           </div>
         </div>
 
-        {visiblePatients.length > 0 ? (
+        {patientsLoading ? (
+          <div className="flex min-h-[350px] flex-col items-center justify-center px-6 text-center">
+            <div className="h-10 w-10 animate-spin rounded-full border-4 border-blue-100 border-t-blue-600" />
+
+            <p className="mt-4 text-sm font-medium text-slate-500">
+              Loading your assigned patients...
+            </p>
+          </div>
+        ) : visiblePatients.length > 0 ? (
           <>
             {view === "table" && (
               <PatientTable patients={visiblePatients} />
@@ -374,7 +1233,8 @@ export default function DoctorPatientsPage() {
               </div>
             )}
 
-            {/* Mobile cards always visible */}
+            {/* MOBILE CARDS ALWAYS VISIBLE */}
+
             {view === "table" && (
               <div className="space-y-3 p-4 lg:hidden">
                 {visiblePatients.map((patient) => (
@@ -394,9 +1254,9 @@ export default function DoctorPatientsPage() {
                 {(page - 1) * PAGE_SIZE + 1}–
                 {Math.min(
                   page * PAGE_SIZE,
-                  filteredPatients.length,
+                  pagination.total,
                 )}{" "}
-                of {filteredPatients.length}
+                of {pagination.total}
               </p>
 
               <div className="flex items-center gap-2">
@@ -439,17 +1299,38 @@ export default function DoctorPatientsPage() {
             </div>
 
             <h3 className="mt-4 font-semibold text-[#102a56]">
-              No patients found
+              {apiError
+                ? "Unable to load patients"
+                : "No patients found"}
             </h3>
 
             <p className="mt-2 max-w-sm text-sm text-slate-400">
-              Try changing your search or filters to find
-              another patient.
+              {apiError
+                ? "There was a problem retrieving your assigned patients. Check your connection and try again."
+                : "You currently have no patients assigned to you, or your search and filters returned no results."}
             </p>
+
+            {apiError && accessToken && (
+              <button
+                type="button"
+                onClick={() =>
+                  void loadAssignedPatients(
+                    accessToken,
+                    page,
+                    search,
+                  )
+                }
+                className="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700"
+              >
+                Try Again
+              </button>
+            )}
           </div>
         )}
       </section>
     </main>
   );
 }
+
+
 

@@ -81,19 +81,19 @@ export const roleNavigation = {
       icon: LayoutDashboard,
     },
     {
-      label: "Users & Staff",
-      href: "/hospital-admin/users",
+      label: "Staff",
+      href: "/hospital-admin/staff",
       icon: UsersRound,
     },
     {
-      label: "Patients",
-      href: "/hospital-admin/patients",
+      label: "Departments",
+      href: "/hospital-admin/departments",
       icon: UsersRound,
     },
     {
-      label: "Appointments",
-      href: "/hospital-admin/appointments",
-      icon: CalendarDays,
+      label: "Doctors",
+      href: "/hospital-admin/doctors",
+      icon: UsersRound,
     },
     {
       label: "Medical Records",
@@ -129,8 +129,13 @@ export const roleNavigation = {
       icon: LayoutDashboard,
     },
     {
+      label: "Triage",
+      href: "/nurse/triage",
+      icon: UsersRound,
+    },
+    {
       label: "Assigned Patients",
-      href: "/nurse/patients",
+      href: "/nurse/assigned patients",
       icon: UsersRound,
     },
     {
@@ -167,14 +172,19 @@ export const roleNavigation = {
       icon: LayoutDashboard,
     },
     {
-      label: "Appointments",
-      href: "/receptionist/appointments",
-      icon: CalendarDays,
-    },
-    {
       label: "Patient Registration",
       href: "/receptionist/register",
       icon: UsersRound,
+    },
+    {
+      label: "Visits",
+      href: "/receptionist/visits",
+      icon: CalendarDays,
+    },
+    {
+      label: "Appointments",
+      href: "/receptionist/appointments",
+      icon: CalendarDays,
     },
     {
       label: "Patients",

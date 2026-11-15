@@ -3,7 +3,9 @@ export type Role =
   | "hospital_admin"
   | "doctor"
   | "nurse"
-  | "receptionist";
+  | "receptionist"
+  | "pharmacist"
+  | "laboratory";
 
 export interface MockUser {
   id: string;

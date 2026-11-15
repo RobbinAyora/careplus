@@ -9,84 +9,103 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type { MockUser, Role } from "./mock-users";
+import type { AuthSession, AuthUser, Role } from "./types";
 
-const SESSION_KEY = "careplus.mock-session";
+const SESSION_KEY = "careplus.auth-session";
+
 const ROLES: Role[] = [
   "super_admin",
   "hospital_admin",
   "doctor",
   "nurse",
   "receptionist",
+  "pharmacist",
+  "laboratory",
 ];
 
 interface AuthContextValue {
-  user: MockUser | null;
-  login: (user: MockUser) => void;
+  user: AuthUser | null;
+  accessToken: string | null;
+  login: (session: AuthSession) => void;
   logout: () => void;
   isSessionLoaded: boolean;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-function readStoredUser(): MockUser | null {
+function isAuthSession(value: unknown): value is AuthSession {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const session = value as Record<string, unknown>;
+
+  if (
+    typeof session.accessToken !== "string" ||
+    !session.accessToken ||
+    !session.user ||
+    typeof session.user !== "object"
+  ) {
+    return false;
+  }
+
+  const user = session.user as Record<string, unknown>;
+
+  return (
+    typeof user.id === "string" &&
+    typeof user.name === "string" &&
+    typeof user.email === "string" &&
+    typeof user.role === "string" &&
+    ROLES.includes(user.role as Role) &&
+    typeof user.mustChangePassword === "boolean" &&
+    (user.hospitalId === undefined ||
+      typeof user.hospitalId === "string")
+  );
+}
+
+function readStoredSession(): AuthSession | null {
   if (typeof window === "undefined") {
     return null;
   }
 
   try {
     const stored = window.sessionStorage.getItem(SESSION_KEY);
+
     if (!stored) {
       return null;
     }
 
     const parsed: unknown = JSON.parse(stored);
-    return isMockUser(parsed) ? parsed : null;
+    return isAuthSession(parsed) ? parsed : null;
   } catch {
     return null;
   }
 }
 
-function isMockUser(value: unknown): value is MockUser {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const user = value as Record<string, unknown>;
-  const hasRequiredFields =
-    typeof user.id === "string" &&
-    typeof user.name === "string" &&
-    typeof user.email === "string" &&
-    typeof user.password === "string" &&
-    typeof user.role === "string" &&
-    ROLES.includes(user.role as Role) &&
-    (user.hospitalId === undefined || typeof user.hospitalId === "string") &&
-    (user.hospitalName === undefined || typeof user.hospitalName === "string");
-
-  return hasRequiredFields;
-}
-
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<MockUser | null>(null);
+  const [session, setSession] = useState<AuthSession | null>(null);
   const [isSessionLoaded, setIsSessionLoaded] = useState(false);
 
   useEffect(() => {
-    setUser(readStoredUser());
+    setSession(readStoredSession());
     setIsSessionLoaded(true);
   }, []);
 
-  const login = useCallback((nextUser: MockUser) => {
-    setUser(nextUser);
+  const login = useCallback((nextSession: AuthSession) => {
+    setSession(nextSession);
 
     try {
-      window.sessionStorage.setItem(SESSION_KEY, JSON.stringify(nextUser));
+      window.sessionStorage.setItem(
+        SESSION_KEY,
+        JSON.stringify(nextSession),
+      );
     } catch {
       // Keep the in-memory session usable if storage is unavailable.
     }
   }, []);
 
   const logout = useCallback(() => {
-    setUser(null);
+    setSession(null);
 
     try {
       window.sessionStorage.removeItem(SESSION_KEY);
@@ -96,18 +115,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ user, login, logout, isSessionLoaded }),
-    [isSessionLoaded, login, logout, user],
+    () => ({
+      user: session?.user ?? null,
+      accessToken: session?.accessToken ?? null,
+      login,
+      logout,
+      isSessionLoaded,
+    }),
+    [session, login, logout, isSessionLoaded],
   );
 
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+  return (
+    <AuthContext.Provider value={value}>
+      {children}
+    </AuthContext.Provider>
+  );
 }
 
 export function useAuth() {
   const context = useContext(AuthContext);
 
   if (!context) {
-    throw new Error("useAuth must be used within an AuthProvider");
+    throw new Error("useAuth must be used within an AuthProvider.");
   }
 
   return context;

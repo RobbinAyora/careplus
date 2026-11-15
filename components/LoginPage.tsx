@@ -3,7 +3,6 @@
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import ImageCarousel, { type CarouselSlide } from "./ImageCarousel";
-import DevQuickLogin from "./DevQuickLogin";
 import { authenticate } from "@/lib/auth/authenticate";
 import { useAuth } from "@/lib/auth/session";
 import { DASHBOARD_PATHS } from "@/lib/auth/role-routes";
@@ -49,8 +48,12 @@ export default function LoginPage() {
       if ("error" in result) {
         setError(result.error);
       } else {
-        login(result.user);
-        router.push(DASHBOARD_PATHS[result.user.role]);
+        login(result.session);
+        if (result.session.user.mustChangePassword) {
+          router.push("/change-password");
+        } else {
+          router.push(DASHBOARD_PATHS[result.session.user.role]);
+        }
       }
     } finally {
       setIsSubmitting(false);
@@ -183,10 +186,7 @@ export default function LoginPage() {
             </a>
           </p>
 
-          <DevQuickLogin onSelect={(email, pw) => {
-            setIdentifier(email);
-            setPassword(pw);
-          }} />
+          
         </div>
 
         {/* Footer */}
@@ -304,3 +304,5 @@ function ArrowRightIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+
+

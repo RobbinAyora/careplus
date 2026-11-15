@@ -22,17 +22,20 @@ export default function DoctorDashboard() {
               WELCOME SECTION
           ======================================================= */}
           <section className="relative mb-5 h-[171px] overflow-hidden rounded-xl bg-[#e7f3ff]">
-            <div className="flex h-full flex-col justify-center px-7">
+             <div className="relative z-10 flex h-full flex-col justify-center px-7">
               <h1 className="text-[28px] font-semibold tracking-[-0.03em] text-[#102f5f]">
-                Good morning, Dr. Mwangi
+                Good morning, Doctor
               </h1>
 
               <p className="mt-2 text-[15px] text-[#55749c]">
-                Here&apos;s what&apos;s happening with your patients today.
+                Here&apos;s what&apos;s happening at the front desk today.
               </p>
 
               <div className="mt-5 flex items-center gap-3 text-sm text-[#55749c]">
-                <CalendarDays size={19} strokeWidth={1.8} />
+                <CalendarDays
+                  size={19}
+                  strokeWidth={1.8}
+                />
 
                 <span>Tuesday, 16 September 2025</span>
               </div>
