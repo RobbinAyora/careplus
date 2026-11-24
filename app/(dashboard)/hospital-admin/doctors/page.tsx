@@ -3,8 +3,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/lib/auth/session";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL;
+import { useApiClient } from "@/lib/api/client";
 
 type AvailabilityStatus = "AVAILABLE" | "ON_BREAK" | "OFF_DUTY";
 
@@ -12,6 +11,15 @@ interface Department {
   id: string;
   name: string;
   isActive: boolean;
+}
+
+interface DoctorWorkload {
+  waitingPatients: number;
+  patientsInConsultation: number;
+  currentWorkload: number;
+  maxPatients: number;
+  remainingCapacity: number;
+  isAtCapacity?: boolean;
 }
 
 interface Doctor {
@@ -33,27 +41,62 @@ interface Doctor {
     } | null;
     availabilityStatus: AvailabilityStatus;
     maxPatients: number;
+    version?: number;
   } | null;
-  waitingPatients?: number;
-  patientsInConsultation?: number;
-  currentWorkload?: number;
-  remainingCapacity?: number;
+  workload?: DoctorWorkload | null;
 }
 
-interface ApiError {
-  message?: string | string[];
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
-function getErrorMessage(data: ApiError, fallback: string) {
-  if (Array.isArray(data.message)) {
-    return data.message.join(", ");
+function getArrayFromResponse<T>(response: unknown): T[] {
+  if (Array.isArray(response)) {
+    return response as T[];
   }
 
-  return data.message || fallback;
+  if (!isRecord(response)) {
+    return [];
+  }
+
+  if (Array.isArray(response.data)) {
+    return response.data as T[];
+  }
+
+  if (Array.isArray(response.items)) {
+    return response.items as T[];
+  }
+
+  if (Array.isArray(response.results)) {
+    return response.results as T[];
+  }
+
+  return [];
+}
+
+function getNextCursor(response: unknown): string | null {
+  if (!isRecord(response) || !isRecord(response.pagination)) {
+    return null;
+  }
+
+  const cursor = response.pagination.nextCursor;
+
+  return typeof cursor === "string" && cursor.length > 0
+    ? cursor
+    : null;
+}
+
+function hasMoreRecords(response: unknown): boolean {
+  if (!isRecord(response) || !isRecord(response.pagination)) {
+    return false;
+  }
+
+  return response.pagination.hasMore === true;
 }
 
 export default function DoctorsPage() {
   const { accessToken, isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
   const [doctors, setDoctors] = useState<Doctor[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
@@ -70,79 +113,91 @@ export default function DoctorsPage() {
   const [selectedDepartmentId, setSelectedDepartmentId] = useState("");
   const [maxPatients, setMaxPatients] = useState("5");
 
-  const apiRequest = useCallback(
-    async (endpoint: string, options: RequestInit = {}) => {
-      if (!API_URL) {
-        throw new Error(
-          "NEXT_PUBLIC_API_URL is not configured in your frontend environment."
-        );
-      }
-
-      if (!accessToken) {
-        throw new Error("Your session has expired. Please log in again.");
-      }
-
-      const response = await fetch(`${API_URL}${endpoint}`, {
-        ...options,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
-          ...options.headers,
-        },
-      });
-
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        throw new Error(
-          getErrorMessage(data as ApiError, "Something went wrong.")
-        );
-      }
-
-      return data;
-    },
-    [accessToken]
-  );
-
   const loadData = useCallback(async () => {
-    if (!accessToken) return;
+    if (!isSessionLoaded) return;
+
+    if (!accessToken) {
+      setLoading(false);
+      setError("Your session has expired. Please log in again.");
+      return;
+    }
 
     setLoading(true);
     setError("");
 
     try {
-      const [doctorsData, departmentsData] = await Promise.all([
-        apiRequest("/doctors"),
-        apiRequest("/departments"),
-      ]);
+      const [firstDoctorsResponse, departmentsResponse] =
+        await Promise.all([
+          apiRequest<unknown>("/doctors"),
+          apiRequest<unknown>("/departments"),
+        ]);
 
-      setDoctors(Array.isArray(doctorsData) ? doctorsData : []);
+      const allDoctors: Doctor[] = getArrayFromResponse<Doctor>(
+        firstDoctorsResponse,
+      );
+
+      let cursor = getNextCursor(firstDoctorsResponse);
+      let hasMore = hasMoreRecords(firstDoctorsResponse);
+
+      // The doctors endpoint uses cursor pagination.
+      // Fetch subsequent pages so the directory and profile setup list
+      // are not limited to the first response page.
+      while (hasMore && cursor) {
+        const params = new URLSearchParams({
+          cursor,
+        });
+
+        const nextResponse = await apiRequest<unknown>(
+          `/doctors?${params.toString()}`,
+        );
+
+        const nextDoctors = getArrayFromResponse<Doctor>(nextResponse);
+
+        if (nextDoctors.length === 0) {
+          break;
+        }
+
+        allDoctors.push(...nextDoctors);
+
+        const nextCursor = getNextCursor(nextResponse);
+        const nextHasMore = hasMoreRecords(nextResponse);
+
+        if (!nextCursor || nextCursor === cursor) {
+          break;
+        }
+
+        cursor = nextCursor;
+        hasMore = nextHasMore;
+      }
+
+      setDoctors(allDoctors);
+
       setDepartments(
-        Array.isArray(departmentsData) ? departmentsData : []
+        getArrayFromResponse<Department>(departmentsResponse),
       );
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : "Failed to load doctors."
+        err instanceof Error ? err.message : "Failed to load doctors.",
       );
     } finally {
       setLoading(false);
     }
-  }, [accessToken, apiRequest]);
+  }, [accessToken, apiRequest, isSessionLoaded]);
 
   useEffect(() => {
-    if (isSessionLoaded && accessToken) {
+    if (isSessionLoaded) {
       void loadData();
     }
-  }, [isSessionLoaded, accessToken, loadData]);
+  }, [isSessionLoaded, loadData]);
 
   const doctorsWithoutProfiles = useMemo(
     () => doctors.filter((doctor) => !doctor.doctorProfile),
-    [doctors]
+    [doctors],
   );
 
   const doctorsWithProfiles = useMemo(
     () => doctors.filter((doctor) => doctor.doctorProfile),
-    [doctors]
+    [doctors],
   );
 
   const filteredDoctors = useMemo(() => {
@@ -180,6 +235,11 @@ export default function DoctorsPage() {
   const handleAddDoctor = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
+    if (!isSessionLoaded || !accessToken) {
+      setError("Your session is still loading or has expired.");
+      return;
+    }
+
     if (!selectedDoctorId || !selectedDepartmentId) {
       setError("Please select a doctor and a department.");
       return;
@@ -196,13 +256,16 @@ export default function DoctorsPage() {
     setError("");
 
     try {
-      await apiRequest(`/doctors/${selectedDoctorId}/profile`, {
-        method: "POST",
-        body: JSON.stringify({
-          departmentId: selectedDepartmentId,
-          maxPatients: capacity,
-        }),
-      });
+      await apiRequest<unknown>(
+        `/doctors/${selectedDoctorId}/profile`,
+        {
+          method: "POST",
+          body: {
+            departmentId: selectedDepartmentId,
+            maxPatients: capacity,
+          },
+        },
+      );
 
       setShowAddModal(false);
       setSuccess("Doctor profile created successfully.");
@@ -211,7 +274,7 @@ export default function DoctorsPage() {
       setError(
         err instanceof Error
           ? err.message
-          : "Failed to create doctor profile."
+          : "Failed to create doctor profile.",
       );
     } finally {
       setSaving(false);
@@ -251,7 +314,7 @@ export default function DoctorsPage() {
   }
 
   const availableDoctors = doctorsWithProfiles.filter(
-    (doctor) => doctor.doctorProfile?.availabilityStatus === "AVAILABLE"
+    (doctor) => doctor.doctorProfile?.availabilityStatus === "AVAILABLE",
   ).length;
 
   return (
@@ -378,10 +441,9 @@ export default function DoctorsPage() {
                   profile?.department ||
                   "Unassigned";
 
-                const workload =
-                  doctor.currentWorkload ??
-                  ((doctor.waitingPatients || 0) +
-                    (doctor.patientsInConsultation || 0));
+                const workload = doctor.workload?.currentWorkload ?? 0;
+                const capacity =
+                  doctor.workload?.maxPatients ?? profile?.maxPatients ?? 0;
 
                 return (
                   <tr
@@ -415,7 +477,7 @@ export default function DoctorsPage() {
                     <td className="px-5 py-4">
                       <span
                         className={`rounded-full px-3 py-1.5 text-xs font-medium ${getAvailabilityStyle(
-                          profile?.availabilityStatus
+                          profile?.availabilityStatus,
                         )}`}
                       >
                         {formatAvailability(profile?.availabilityStatus)}
@@ -427,7 +489,7 @@ export default function DoctorsPage() {
                     </td>
 
                     <td className="px-5 py-4 text-slate-600">
-                      {profile?.maxPatients ?? "-"} patients
+                      {capacity || "-"} patients
                     </td>
 
                     <td className="px-5 py-4">
@@ -675,3 +737,4 @@ function StatCard({
     </div>
   );
 }
+

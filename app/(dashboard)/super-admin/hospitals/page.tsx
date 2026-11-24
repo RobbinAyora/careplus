@@ -11,8 +11,7 @@ import {
 } from "react";
 
 import { useAuth } from "@/lib/auth/session";
-
-const API_URL = process.env.NEXT_PUBLIC_API_URL;
+import { useApiClient } from "@/lib/api/client";
 
 type HospitalStatus = "ACTIVE" | "INACTIVE" | "SUSPENDED";
 
@@ -45,34 +44,6 @@ const EMPTY_FORM: HospitalForm = {
   city: "",
   country: "Kenya",
 };
-
-function getErrorMessage(data: unknown): string {
-  if (data && typeof data === "object" && "message" in data) {
-    const message = data.message;
-
-    if (Array.isArray(message)) {
-      return message.join(", ");
-    }
-
-    if (typeof message === "string") {
-      return message;
-    }
-  }
-
-  return "Something went wrong. Please try again.";
-}
-
-async function readResponse(response: Response): Promise<unknown> {
-  const text = await response.text();
-
-  if (!text) return null;
-
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return { message: text };
-  }
-}
 
 function formatDate(date: string) {
   const parsed = new Date(date);
@@ -112,6 +83,7 @@ function StatusBadge({ status }: { status: HospitalStatus }) {
 
 export default function HospitalsPage() {
   const { accessToken, isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
   const [hospitals, setHospitals] = useState<Hospital[]>([]);
   const [loading, setLoading] = useState(true);
@@ -138,15 +110,9 @@ export default function HospitalsPage() {
 
   // FETCH HOSPITALS
   const fetchHospitals = useCallback(async () => {
-    if (!API_URL || !accessToken) {
+    if (!accessToken) {
       setLoading(false);
-
-      setError(
-        !API_URL
-          ? "API URL is not configured."
-          : "Please sign in."
-      );
-
+      setError("Please sign in.");
       return;
     }
 
@@ -154,18 +120,7 @@ export default function HospitalsPage() {
     setError("");
 
     try {
-      const response = await fetch(`${API_URL}/hospitals`, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-        cache: "no-store",
-      });
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
+      const data = await apiRequest<unknown>("/hospitals");
 
       if (!Array.isArray(data)) {
         throw new Error("Unexpected hospital list received.");
@@ -181,7 +136,7 @@ export default function HospitalsPage() {
     } finally {
       setLoading(false);
     }
-  }, [accessToken]);
+  }, [accessToken, apiRequest]);
 
   useEffect(() => {
     if (isSessionLoaded) {
@@ -255,41 +210,38 @@ export default function HospitalsPage() {
     event: FormEvent<HTMLFormElement>
   ) {
     event.preventDefault();
+
+    if (saving) return;
+
     setFormError("");
 
-    if (!API_URL || !accessToken) {
-      setFormError(
-        "Your session or API configuration is missing."
-      );
+    if (!accessToken) {
+      setFormError("Your session has expired. Please sign in again.");
+      return;
+    }
+
+    const payload = {
+      name: form.name.trim(),
+      email: form.email.trim().toLowerCase(),
+      phone: form.phone.trim() || undefined,
+      address: form.address.trim() || undefined,
+      city: form.city.trim() || undefined,
+      country: form.country.trim() || "Kenya",
+    };
+
+    if (!payload.name || !payload.email) {
+      setFormError("Hospital name and email are required.");
       return;
     }
 
     setSaving(true);
 
     try {
-      const response = await fetch(`${API_URL}/hospitals`, {
+      // useApiClient automatically attaches an Idempotency-Key.
+      await apiRequest<unknown>("/hospitals", {
         method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
-        },
-
-        body: JSON.stringify({
-          name: form.name.trim(),
-          email: form.email.trim().toLowerCase(),
-          phone: form.phone.trim() || undefined,
-          address: form.address.trim() || undefined,
-          city: form.city.trim() || undefined,
-          country: form.country.trim() || "Kenya",
-        }),
+        body: payload,
       });
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
 
       setForm(EMPTY_FORM);
       setModalOpen(false);
@@ -310,8 +262,8 @@ export default function HospitalsPage() {
 
   // SUSPEND OR REACTIVATE HOSPITAL
   async function handleHospitalStatusChange() {
-    if (!API_URL || !accessToken || !hospitalToChange) {
-      setError("Your session or API configuration is missing.");
+    if (!accessToken || !hospitalToChange) {
+      setError("Your session has expired. Please sign in again.");
       return;
     }
 
@@ -328,27 +280,15 @@ export default function HospitalsPage() {
     setError("");
 
     try {
-      const response = await fetch(
-        `${API_URL}/hospitals/${hospital.id}/status`,
+      await apiRequest<unknown>(
+        `/hospitals/${hospital.id}/status`,
         {
           method: "PATCH",
-
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`,
-          },
-
-          body: JSON.stringify({
+          body: {
             status: newStatus,
-          }),
+          },
         }
       );
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
 
       // Update the directory immediately.
       setHospitals((current) =>
@@ -1015,8 +955,8 @@ export default function HospitalsPage() {
 
               <p className="text-sm leading-6 text-slate-600">
                 {hospitalToChange.status === "ACTIVE"
-                  ? "You are about to suspend this hospital. Its administrators and other users should no longer be able to access the hospital system once server-side access enforcement is in place."
-                  : "You are about to reactivate this hospital. Users whose individual accounts are still active will be able to access the hospital system again once server-side access enforcement is in place."}
+                  ? "You are about to suspend this hospital. Its administrators and other users will no longer be able to access the hospital system while the hospital is suspended."
+                  : "You are about to reactivate this hospital. Users whose individual accounts are still active will be able to access the hospital system again."}
               </p>
 
               {/* HOSPITAL INFORMATION */}
@@ -1142,5 +1082,3 @@ function DetailItem({
     </div>
   );
 }
-
-

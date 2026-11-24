@@ -9,8 +9,8 @@ import {
   type FormEvent,
 } from "react";
 import { useAuth } from "@/lib/auth/session";
+import { useApiClient } from "@/lib/api/client";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
 type HospitalStatus = "ACTIVE" | "INACTIVE" | "SUSPENDED";
 
@@ -62,35 +62,6 @@ const EMPTY_FORM: HospitalForm = {
   country: "Kenya",
 };
 
-function getErrorMessage(data: unknown): string {
-  if (data && typeof data === "object" && "message" in data) {
-    const message = data.message;
-
-    if (Array.isArray(message)) {
-      return message
-        .filter((item): item is string => typeof item === "string")
-        .join(", ");
-    }
-
-    if (typeof message === "string") {
-      return message;
-    }
-  }
-
-  return "Something went wrong. Please try again.";
-}
-
-async function readResponse(response: Response): Promise<unknown> {
-  const text = await response.text();
-
-  if (!text) return null;
-
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return { message: text };
-  }
-}
 
 function formatDate(date: string) {
   const parsedDate = new Date(date);
@@ -139,6 +110,7 @@ function getHospitalAdmins(hospital: Hospital): HospitalAdmin[] {
 
 export default function SuperAdminPage() {
   const { accessToken, isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
   const [hospitals, setHospitals] = useState<Hospital[]>([]);
   const [loading, setLoading] = useState(true);
@@ -177,13 +149,9 @@ export default function SuperAdminPage() {
 
   // Fetch hospitals from the backend.
   const fetchHospitals = useCallback(async () => {
-    if (!API_URL || !accessToken) {
+    if (!accessToken) {
       setLoading(false);
-      setError(
-        !API_URL
-          ? "API URL is not configured."
-          : "Please sign in to view hospitals."
-      );
+      setError("Please sign in to view hospitals.");
       return false;
     }
 
@@ -191,18 +159,7 @@ export default function SuperAdminPage() {
     setError("");
 
     try {
-      const response = await fetch(`${API_URL}/hospitals`, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-        cache: "no-store",
-      });
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
+      const data = await apiRequest<unknown>("/hospitals");
 
       if (!Array.isArray(data)) {
         throw new Error("The server returned an unexpected hospital list.");
@@ -219,7 +176,7 @@ export default function SuperAdminPage() {
     } finally {
       setLoading(false);
     }
-  }, [accessToken]);
+  }, [accessToken, apiRequest]);
 
   useEffect(() => {
     if (isSessionLoaded) {
@@ -288,7 +245,7 @@ export default function SuperAdminPage() {
     event.preventDefault();
     setFormError("");
 
-    if (!accessToken || !API_URL) {
+    if (!accessToken) {
       setFormError("Your session or API configuration is missing.");
       return;
     }
@@ -296,27 +253,17 @@ export default function SuperAdminPage() {
     setSaving(true);
 
     try {
-      const response = await fetch(`${API_URL}/hospitals`, {
+      await apiRequest<unknown>("/hospitals", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify({
+        body: {
           name: form.name.trim(),
           email: form.email.trim().toLowerCase(),
           phone: form.phone.trim() || undefined,
           address: form.address.trim() || undefined,
           city: form.city.trim() || undefined,
           country: form.country.trim() || "Kenya",
-        }),
+        },
       });
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
 
       setForm(EMPTY_FORM);
       setModalOpen(false);

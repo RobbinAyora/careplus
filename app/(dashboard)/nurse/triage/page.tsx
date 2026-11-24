@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type FormEvent,
 } from "react";
@@ -32,9 +33,9 @@ import {
 } from "lucide-react";
 
 import { useAuth } from "@/lib/auth/session";
-
-const API_URL =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ?? "";
+import { useApiClient, ApiError } from "@/lib/api/client";
+import { fetchAllPages } from "@/lib/api/pagination";
+import { useIdempotencyKey } from "@/lib/api/idempotency";
 
 const PAGE_SIZE = 20;
 
@@ -82,6 +83,17 @@ interface Visit {
   queueEntry?: QueueEntry | null;
 }
 
+interface UnassignedQueueEntry extends QueueEntry {
+  assignedDoctorId?: string | null;
+  triagedAt?: string | null;
+  visit: Visit & {
+    triageRecord?: {
+      priority: TriagePriority;
+    } | null;
+    departmentRef?: Department | null;
+  };
+}
+
 interface TriageForm {
   chiefComplaint: string;
   temperature: string;
@@ -113,6 +125,22 @@ const initialForm: TriageForm = {
   priority: "NORMAL",
   additionalNotes: "",
 };
+
+interface TriageResult {
+  message?: string;
+  alreadyRecorded?: boolean;
+  triage?: { id: string; version?: number };
+  assignment?: {
+    assigned: boolean;
+    doctor?: {
+      id: string;
+      firstName: string;
+      lastName: string;
+      department?: string | null;
+    } | null;
+    message?: string;
+  };
+}
 
 const inputClass =
   "w-full rounded-xl border border-[#e2eaf4] bg-white px-3.5 py-3 text-sm text-[#18365f] outline-none transition placeholder:text-[#9aabc0] focus:border-[#2d91e8] focus:ring-2 focus:ring-[#2d91e8]/10";
@@ -200,87 +228,67 @@ function optionalInteger(value: string) {
   return Number.parseInt(value, 10);
 }
 
-// --------------------------------------------------
-// API RESPONSE HANDLER WITH DIAGNOSTIC LOGGING
-// --------------------------------------------------
-
-async function readResponse(
-  response: Response,
-  endpoint: string,
-): Promise<unknown> {
-  const data: unknown = await response.json().catch(() => null);
-
-  console.group(`[CarePlus API] ${endpoint}`);
-
-  console.log("HTTP status:", response.status);
-  console.log("Status text:", response.statusText);
-  console.log("Request successful:", response.ok);
-
-  if (!response.ok) {
-    console.error("Backend error response:", data);
-  } else {
-    console.log("Request completed successfully.");
-    console.log("Response data:", data);
-  }
-
-  console.groupEnd();
-
-  if (!response.ok) {
-    if (
-      typeof data === "object" &&
-      data !== null &&
-      "message" in data
-    ) {
-      const message = data.message;
-
-      throw new Error(
-        Array.isArray(message)
-          ? message.join(", ")
-          : String(message),
-      );
-    }
-
-    throw new Error(
-      `Request failed: ${response.status} ${response.statusText}`,
-    );
-  }
-
-  return data;
-}
-
 function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
+function describeAssignment(result: TriageResult) {
+  const assignment = result.assignment;
+
+  if (assignment?.assigned && assignment.doctor) {
+    const department = assignment.doctor.department
+      ? ` (${assignment.doctor.department})`
+      : "";
+
+    return `Assigned to Dr. ${assignment.doctor.firstName} ${assignment.doctor.lastName}${department}.`;
+  }
+
+  if (assignment && !assignment.assigned) {
+    return "No suitable doctor is currently available; the patient remains in the waiting queue.";
+  }
+
+  return "";
+}
+
 export default function TriagePage() {
   // --------------------------------------------------
-  // AUTHENTICATION
+  // AUTHENTICATION AND CENTRAL API CLIENT
   // --------------------------------------------------
 
-  const { accessToken, isSessionLoaded } = useAuth();
+  const { isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
-  // Authentication diagnostics
+  const triageKey = useIdempotencyKey();
+  const unassignedInFlight = useRef(false);
+
   useEffect(() => {
     console.group("[CarePlus] Authentication diagnostics");
 
     console.log("Session loaded:", isSessionLoaded);
-    console.log("Access token available:", Boolean(accessToken));
-    console.log("API URL:", API_URL || "NOT CONFIGURED");
+    console.log(
+      "API URL configured:",
+      Boolean(process.env.NEXT_PUBLIC_API_URL),
+    );
 
     if (!isSessionLoaded) {
       console.warn("Authentication session is still loading.");
-    } else if (!accessToken) {
-      console.error("No access token found after session loading.");
     } else {
-      console.log("An access token is available.");
+      console.log("Authentication session has loaded.");
     }
 
     console.groupEnd();
-  }, [isSessionLoaded, accessToken]);
+  }, [isSessionLoaded]);
 
   const [queue, setQueue] = useState<Visit[]>([]);
   const [selectedVisit, setSelectedVisit] =
     useState<Visit | null>(null);
+
+  const [unassignedPatients, setUnassignedPatients] = useState<
+    UnassignedQueueEntry[]
+  >([]);
+
+  const [loadingUnassigned, setLoadingUnassigned] = useState(false);
+  const [unassignedError, setUnassignedError] = useState("");
 
   const [form, setForm] = useState<TriageForm>(initialForm);
 
@@ -296,7 +304,6 @@ export default function TriagePage() {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
-  // Department state
   const [departments, setDepartments] = useState<Department[]>([]);
   const [selectedDepartmentId, setSelectedDepartmentId] =
     useState("");
@@ -308,56 +315,21 @@ export default function TriagePage() {
   // --------------------------------------------------
 
   const loadDepartments = useCallback(async () => {
-    console.group("[CarePlus] Loading departments");
-
-    console.log("Session loaded:", isSessionLoaded);
-    console.log("Access token available:", Boolean(accessToken));
-    console.log("API URL configured:", Boolean(API_URL));
-
     if (!isSessionLoaded) {
-      console.warn("Waiting for authentication session.");
-      console.groupEnd();
       return;
     }
 
-    if (!accessToken) {
-      console.error("No access token available for departments.");
-      setLoadingDepartments(false);
-      console.groupEnd();
-      return;
-    }
-
-    if (!API_URL) {
-      console.error("NEXT_PUBLIC_API_URL is not configured.");
-      setError("API URL is not configured.");
-      setLoadingDepartments(false);
-      console.groupEnd();
-      return;
-    }
-
-    const endpoint = `${API_URL}/departments`;
-
-    console.log("Request URL:", endpoint);
+    console.log("[CarePlus] Loading departments");
 
     setLoadingDepartments(true);
 
     try {
-      const response = await fetch(endpoint, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-        cache: "no-store",
-      });
+      const data = await fetchAllPages<Department>(
+        apiRequest,
+        "/departments",
+      );
 
-      const data = await readResponse(response, endpoint);
-
-      if (!Array.isArray(data)) {
-        console.error("Unexpected departments response:", data);
-        throw new Error("Invalid departments response.");
-      }
-
-      const activeDepartments = (data as Department[]).filter(
+      const activeDepartments = data.filter(
         (department) => department.isActive,
       );
 
@@ -366,7 +338,10 @@ export default function TriagePage() {
 
       setDepartments(activeDepartments);
     } catch (err) {
-      console.error("[CarePlus] Department loading failed:", err);
+      console.error(
+        "[CarePlus] Department loading failed:",
+        err,
+      );
 
       setError(
         getErrorMessage(
@@ -376,9 +351,8 @@ export default function TriagePage() {
       );
     } finally {
       setLoadingDepartments(false);
-      console.groupEnd();
     }
-  }, [accessToken, isSessionLoaded]);
+  }, [apiRequest, isSessionLoaded]);
 
   useEffect(() => {
     if (isSessionLoaded) {
@@ -391,76 +365,117 @@ export default function TriagePage() {
   // --------------------------------------------------
 
   const loadQueue = useCallback(async () => {
-    console.group("[CarePlus] Loading triage queue");
-
-    console.log("Session loaded:", isSessionLoaded);
-    console.log("Access token available:", Boolean(accessToken));
-    console.log("API URL configured:", Boolean(API_URL));
-
     if (!isSessionLoaded) {
-      console.warn("Waiting for authentication session.");
-      console.groupEnd();
       return;
     }
 
-    if (!accessToken) {
-      console.error("No access token available for triage queue.");
-      setLoading(false);
-      console.groupEnd();
-      return;
-    }
-
-    if (!API_URL) {
-      console.error("NEXT_PUBLIC_API_URL is not configured.");
-      setError("API URL is not configured.");
-      setLoading(false);
-      console.groupEnd();
-      return;
-    }
-
-    const endpoint = `${API_URL}/triage/queue`;
-
-    console.log("Request URL:", endpoint);
+    console.log("[CarePlus] Loading triage queue");
 
     setLoading(true);
     setError("");
 
     try {
-      const response = await fetch(endpoint, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-        cache: "no-store",
-      });
-
-      const data = await readResponse(response, endpoint);
-
-      if (!Array.isArray(data)) {
-        console.error("Unexpected triage queue response:", data);
-        throw new Error("Invalid triage queue response.");
-      }
+      const data = await fetchAllPages<Visit>(
+        apiRequest,
+        "/triage/queue",
+        { limit: 100 },
+      );
 
       console.log("Queue records received:", data.length);
 
-      setQueue(data as Visit[]);
+      // Exclude cancelled visits from the triage queue.
+      setQueue(
+        data.filter((visit) => visit.status !== "CANCELLED"),
+      );
     } catch (err) {
-      console.error("[CarePlus] Queue loading failed:", err);
+      console.error(
+        "[CarePlus] Queue loading failed:",
+        err,
+      );
 
       setError(
         getErrorMessage(err, "Unable to load triage queue."),
       );
     } finally {
       setLoading(false);
-      console.groupEnd();
     }
-  }, [accessToken, isSessionLoaded]);
+  }, [apiRequest, isSessionLoaded]);
 
   useEffect(() => {
     if (isSessionLoaded) {
       void loadQueue();
     }
   }, [isSessionLoaded, loadQueue]);
+
+  // --------------------------------------------------
+  // LOAD UNASSIGNED PATIENTS
+  // --------------------------------------------------
+
+  const loadUnassignedPatients = useCallback(async () => {
+    if (!isSessionLoaded) {
+      return;
+    }
+
+    // Skip if the previous load is still running. On a slow connection
+    // overlapping polls would pile up.
+    if (unassignedInFlight.current) {
+      return;
+    }
+
+    unassignedInFlight.current = true;
+
+    setLoadingUnassigned(true);
+    setUnassignedError("");
+
+    try {
+      const entries = await fetchAllPages<UnassignedQueueEntry>(
+        apiRequest,
+        "/triage/unassigned",
+        { limit: 100, maxPages: 5 },
+      );
+
+      setUnassignedPatients(entries);
+    } catch (err) {
+      console.error(
+        "[CarePlus] Unassigned patients loading failed:",
+        err,
+      );
+
+      setUnassignedError(
+        getErrorMessage(
+          err,
+          "Unable to load unassigned patients.",
+        ),
+      );
+    } finally {
+      unassignedInFlight.current = false;
+      setLoadingUnassigned(false);
+    }
+  }, [apiRequest, isSessionLoaded]);
+
+  // --------------------------------------------------
+  // AUTOMATICALLY REFRESH UNASSIGNED PATIENTS
+  // --------------------------------------------------
+
+  useEffect(() => {
+    if (!isSessionLoaded) {
+      return;
+    }
+
+    void loadUnassignedPatients();
+
+    const interval = window.setInterval(() => {
+      if (document.hidden) {
+        return;
+      }
+
+      void loadUnassignedPatients();
+    }, 15000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [isSessionLoaded, loadUnassignedPatients]);
 
   // --------------------------------------------------
   // FILTER AND SEARCH
@@ -548,8 +563,6 @@ export default function TriagePage() {
     setSelectedVisit(visit);
     setForm(initialForm);
 
-    // Reset department selection for each patient.
-    // If the visit already has a departmentId, retain it.
     setSelectedDepartmentId(visit.departmentId ?? "");
 
     setError("");
@@ -574,46 +587,24 @@ export default function TriagePage() {
   ) => {
     event.preventDefault();
 
-    console.group("[CarePlus] Triage submission");
-
-    console.log("Session loaded:", isSessionLoaded);
-    console.log("Access token available:", Boolean(accessToken));
-    console.log("Selected visit available:", Boolean(selectedVisit));
-    console.log("API URL configured:", Boolean(API_URL));
-
     if (!selectedVisit) {
-      console.error("No patient selected.");
-      console.groupEnd();
       return;
     }
 
-    if (!isSessionLoaded || !accessToken) {
-      console.error("Authentication is not available.");
-      setError("Your session is not authenticated. Please log in again.");
-      console.groupEnd();
+    if (!isSessionLoaded) {
+      setError(
+        "Your session is still loading. Please try again.",
+      );
       return;
     }
-
-    if (!API_URL) {
-      console.error("NEXT_PUBLIC_API_URL is not configured.");
-      setError("API URL is not configured.");
-      console.groupEnd();
-      return;
-    }
-
-    console.log("Visit ID:", selectedVisit.id);
-    console.log("Department ID:", selectedDepartmentId);
 
     if (form.chiefComplaint.trim().length < 2) {
       setError("Please enter the patient's chief complaint.");
-      console.groupEnd();
       return;
     }
 
-    // Department is required for doctor assignment.
     if (!selectedDepartmentId) {
       setError("Please select the department for this patient.");
-      console.groupEnd();
       return;
     }
 
@@ -638,7 +629,6 @@ export default function TriagePage() {
       setError(
         "Please enter valid numerical values for the vital signs.",
       );
-      console.groupEnd();
       return;
     }
 
@@ -659,7 +649,6 @@ export default function TriagePage() {
       setError(
         "Pulse, blood pressure and respiratory rate must be whole numbers.",
       );
-      console.groupEnd();
       return;
     }
 
@@ -687,36 +676,29 @@ export default function TriagePage() {
       departmentId: selectedDepartmentId,
     };
 
-    const endpoint = `${API_URL}/triage/${selectedVisit.id}`;
-
-    console.log("Request URL:", endpoint);
-    console.log("Request method: POST");
-    console.log("Request payload:", payload);
-
     setSaving(true);
     setError("");
     setSuccess("");
 
     try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
+      // The same key is reused while the form is unchanged, so a retry
+      // after a lost response or a double click cannot triage twice.
+      const result = await apiRequest<TriageResult>(
+        `/triage/${selectedVisit.id}`,
+        {
+          method: "POST",
+          body: payload,
+          headers: {
+            "Idempotency-Key": triageKey.keyFor({
+              visitId: selectedVisit.id,
+              ...payload,
+            }),
+          },
+          retryWrites: true,
         },
-        body: JSON.stringify(payload),
-      });
-
-      const result = await readResponse(response, endpoint);
-
-      console.log("Triage submission successful.");
-      console.log("Assignment information:",
-        typeof result === "object" &&
-        result !== null &&
-        "assignment" in result
-          ? result.assignment
-          : "No assignment information returned"
       );
+
+      triageKey.reset();
 
       setQueue((previous) =>
         previous.filter(
@@ -728,43 +710,57 @@ export default function TriagePage() {
       setForm(initialForm);
       setSelectedDepartmentId("");
 
-      // Show whether a doctor was assigned.
-      if (
-        typeof result === "object" &&
-        result !== null &&
-        "assignment" in result
-      ) {
-        const assignment = result.assignment;
+      void loadUnassignedPatients();
 
-        if (
-          typeof assignment === "object" &&
-          assignment !== null &&
-          "assigned" in assignment &&
-          assignment.assigned === true
-        ) {
-          setSuccess(
-            "Triage completed successfully. Patient assigned to an available doctor.",
-          );
-        } else {
-          setSuccess(
-            "Triage completed successfully. No suitable doctor is currently available; the patient remains in the waiting queue.",
-          );
-        }
-      } else {
-        setSuccess("Triage assessment saved successfully.");
-      }
-    } catch (err) {
-      console.error("[CarePlus] Triage submission failed:", err);
+      const prefix = result?.alreadyRecorded
+        ? "This patient had already been triaged. "
+        : "Triage completed successfully. ";
 
-      setError(
-        getErrorMessage(
-          err,
-          "Unable to save triage assessment.",
-        ),
+      setSuccess(
+        `${prefix}${describeAssignment(result ?? {})}`.trim(),
       );
+    } catch (err) {
+      if (
+        err instanceof ApiError &&
+        (err.code === "VISIT_STATE_CHANGED" ||
+          err.code === "QUEUE_STATE_CHANGED")
+      ) {
+        // Another nurse triaged this visit first.
+        triageKey.reset();
+
+        setSelectedVisit(null);
+        setForm(initialForm);
+        setSelectedDepartmentId("");
+
+        setError(
+          "This visit was changed by another user and may already have been triaged. The queue has been refreshed.",
+        );
+
+        void loadQueue();
+        void loadUnassignedPatients();
+
+        return;
+      }
+
+      let message = getErrorMessage(
+        err,
+        "Unable to save triage assessment.",
+      );
+
+      if (err instanceof ApiError) {
+        if (err.retryable) {
+          message +=
+            " Your entries are kept. Press Complete triage again; it is safe to retry.";
+        }
+
+        if (err.requestId && err.status >= 500) {
+          message += ` (Reference: ${err.requestId})`;
+        }
+      }
+
+      setError(message);
     } finally {
       setSaving(false);
-      console.groupEnd();
     }
   };
 
@@ -810,7 +806,10 @@ export default function TriagePage() {
 
         <button
           type="button"
-          onClick={() => void loadQueue()}
+          onClick={() => {
+            void loadQueue();
+            void loadUnassignedPatients();
+          }}
           disabled={loading}
           className="flex h-11 items-center justify-center gap-2 rounded-xl border border-[#e2ebf6] bg-white px-4 text-sm font-semibold text-[#55749c] shadow-sm transition hover:bg-[#f7fbff] disabled:opacity-50"
         >
@@ -1390,10 +1389,203 @@ export default function TriagePage() {
         )}
       </section>
 
+      {/* UNASSIGNED PATIENTS */}
+
+      <section className="mt-6 overflow-hidden rounded-xl border border-[#e5eef9] bg-white shadow-[0_2px_10px_rgba(28,78,121,0.03)]">
+
+        <div className="flex flex-col justify-between gap-3 border-b border-[#edf2f8] p-5 sm:flex-row sm:items-center sm:p-6">
+          <div>
+            <h2 className="text-base font-semibold text-[#102f5f]">
+              Unassigned patients
+            </h2>
+
+            <p className="mt-1 text-xs text-[#91a3ba]">
+              Triaged patients waiting for an available doctor.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <span className="rounded-full bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-700">
+              {unassignedPatients.length} waiting
+            </span>
+
+            <button
+              type="button"
+              onClick={() => void loadUnassignedPatients()}
+              disabled={loadingUnassigned}
+              className="flex h-9 items-center gap-2 rounded-lg border border-[#e2ebf6] px-3 text-xs font-semibold text-[#55749c] transition hover:bg-[#f7fbff] disabled:opacity-50"
+            >
+              <RefreshCw
+                size={14}
+                className={loadingUnassigned ? "animate-spin" : ""}
+              />
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        {unassignedError ? (
+          <div className="px-6 py-10 text-center">
+            <AlertCircle
+              size={25}
+              className="mx-auto text-red-500"
+            />
+
+            <p className="mt-3 text-sm font-semibold text-[#18365f]">
+              Unable to load unassigned patients
+            </p>
+
+            <p className="mt-2 text-xs text-red-500">
+              {unassignedError}
+            </p>
+
+            <button
+              type="button"
+              onClick={() => void loadUnassignedPatients()}
+              className="mt-4 rounded-lg bg-[#2d91e8] px-4 py-2 text-xs font-semibold text-white"
+            >
+              Try again
+            </button>
+          </div>
+        ) : loadingUnassigned && unassignedPatients.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12 text-[#7890ae]">
+            <RefreshCw size={24} className="animate-spin" />
+
+            <p className="mt-3 text-sm">
+              Loading unassigned patients...
+            </p>
+          </div>
+        ) : unassignedPatients.length === 0 ? (
+          <div className="flex flex-col items-center justify-center px-6 py-12 text-center">
+            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-green-50 text-green-600">
+              <CheckCircle2 size={23} />
+            </div>
+
+            <h3 className="mt-3 text-sm font-semibold text-[#18365f]">
+              No unassigned patients
+            </h3>
+
+            <p className="mt-2 max-w-sm text-xs leading-5 text-[#91a3ba]">
+              All currently triaged patients have either been assigned
+              to doctors or completed their consultations.
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[750px] text-left">
+              <thead className="bg-[#f8fafd]">
+                <tr className="border-b border-[#edf2f8]">
+                  <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-wide text-[#8ca0b9]">
+                    Patient
+                  </th>
+
+                  <th className="px-5 py-4 text-[10px] font-bold uppercase tracking-wide text-[#8ca0b9]">
+                    Visit number
+                  </th>
+
+                  <th className="px-5 py-4 text-[10px] font-bold uppercase tracking-wide text-[#8ca0b9]">
+                    Department
+                  </th>
+
+                  <th className="px-5 py-4 text-[10px] font-bold uppercase tracking-wide text-[#8ca0b9]">
+                    Priority
+                  </th>
+
+                  <th className="px-6 py-4 text-[10px] font-bold uppercase tracking-wide text-[#8ca0b9]">
+                    Waiting since
+                  </th>
+                </tr>
+              </thead>
+
+              <tbody className="divide-y divide-[#edf2f8]">
+                {unassignedPatients.map((entry) => {
+                  const visit = entry.visit;
+
+                  const priority =
+                    visit.triageRecord?.priority ?? "NORMAL";
+
+                  const priorityStyles: Record<
+                    TriagePriority,
+                    string
+                  > = {
+                    EMERGENCY: "bg-red-50 text-red-700",
+                    URGENT: "bg-orange-50 text-orange-700",
+                    NORMAL: "bg-blue-50 text-blue-700",
+                    LOW: "bg-slate-50 text-slate-600",
+                  };
+
+                  return (
+                    <tr
+                      key={entry.id}
+                      className="transition hover:bg-[#f9fbfe]"
+                    >
+                      <td className="px-6 py-4">
+                        <p className="text-sm font-semibold text-[#18365f]">
+                          {getPatientName(visit.patient)}
+                        </p>
+
+                        <p className="mt-1 text-xs text-[#91a3ba]">
+                          {visit.patient.patientNumber}
+                        </p>
+                      </td>
+
+                      <td className="px-5 py-4">
+                        <p className="text-xs font-semibold text-[#18365f]">
+                          {visit.visitNumber}
+                        </p>
+                      </td>
+
+                      <td className="px-5 py-4">
+                        <p className="text-xs font-medium text-[#55749c]">
+                          {entry.department ||
+                            visit.departmentRef?.name ||
+                            "Not recorded"}
+                        </p>
+                      </td>
+
+                      <td className="px-5 py-4">
+                        <span
+                          className={`rounded-full px-2.5 py-1.5 text-[10px] font-bold ${priorityStyles[priority]}`}
+                        >
+                          {priority}
+                        </span>
+                      </td>
+
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-1.5 text-xs text-[#55749c]">
+                          <Clock3
+                            size={13}
+                            className="text-[#91a3ba]"
+                          />
+
+                          {formatDate(
+                            entry.triagedAt ||
+                              entry.checkedInAt ||
+                              visit.createdAt,
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="border-t border-[#edf2f8] px-5 py-3 sm:px-6">
+          <p className="text-[11px] text-[#91a3ba]">
+            This list automatically refreshes every 15 seconds to reflect
+            doctor assignments.
+          </p>
+        </div>
+      </section>
+
       {/* ASSESSMENT DRAWER */}
 
       {selectedVisit && (
         <div className="fixed inset-0 z-50 flex justify-end">
+
           {/* BACKDROP */}
 
           <button
@@ -1412,6 +1604,7 @@ export default function TriagePage() {
             aria-labelledby="triage-panel-title"
             className="relative z-10 flex h-full w-full max-w-[760px] flex-col bg-[#f8fafd] shadow-2xl"
           >
+
             {/* DRAWER HEADER */}
 
             <div className="flex shrink-0 items-center justify-between border-b border-[#e5edf6] bg-white px-5 py-4 sm:px-7">
@@ -2009,7 +2202,11 @@ export default function TriagePage() {
               <button
                 type="submit"
                 form="triage-form"
-                disabled={saving || loadingDepartments || departments.length === 0}
+                disabled={
+                  saving ||
+                  loadingDepartments ||
+                  departments.length === 0
+                }
                 className="flex h-11 items-center justify-center gap-2 rounded-xl bg-[#2d91e8] px-6 text-sm font-semibold text-white shadow-sm transition hover:bg-[#187fd8] disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {saving ? (
@@ -2034,4 +2231,7 @@ export default function TriagePage() {
     </div>
   );
 }
+
+
+
 

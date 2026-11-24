@@ -1,3 +1,4 @@
+
 "use client";
 
 import {
@@ -5,42 +6,174 @@ import {
   ChevronDown,
   Plus,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+
+import { useApiClient } from "@/lib/api/client";
 
 import AppointmentFilters from "./AppointmentFilters";
 import AppointmentList from "./AppointmentList";
 import ConsultationView from "./ConsultationView";
 import {
-  appointments as initialAppointments,
+  normalizeAppointmentPage,
   type Appointment,
 } from "./appointments-data";
 
 type StatusFilter =
   | "all"
   | "checked_in"
-  | "in_progress"
+  | "confirmed"
   | "scheduled"
   | "completed"
   | "no_show"
   | "cancelled";
 
-export default function AppointmentsPage() {
-  const [appointments, setAppointments] = useState(
-    initialAppointments,
-  );
+type DateRange = "today" | "week" | "upcoming";
 
+interface AppointmentPageResponse {
+  data?: unknown[];
+  nextCursor?: string | null;
+  hasMore?: boolean;
+}
+
+function getDateRange(range: DateRange) {
+  const now = new Date();
+  const start = new Date(now);
+  const end = new Date(now);
+
+  start.setHours(0, 0, 0, 0);
+
+  if (range === "today") {
+    end.setDate(end.getDate() + 1);
+    end.setHours(0, 0, 0, 0);
+  } else if (range === "week") {
+    const day = start.getDay();
+    const daysSinceMonday = day === 0 ? 6 : day - 1;
+
+    start.setDate(start.getDate() - daysSinceMonday);
+
+    end.setTime(start.getTime());
+    end.setDate(end.getDate() + 7);
+  } else {
+    start.setTime(now.getTime());
+    end.setFullYear(end.getFullYear() + 1);
+  }
+
+  return {
+    from: start.toISOString(),
+    to: end.toISOString(),
+  };
+}
+
+function getApiStatus(status: StatusFilter): string | undefined {
+  if (status === "all") return undefined;
+
+  return status.toUpperCase();
+}
+
+function formatDate(date: Date) {
+  return date.toLocaleDateString("en-GB", {
+    weekday: "short",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+export default function AppointmentsPage() {
+  const apiRequest = useApiClient();
+
+  const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [selectedAppointment, setSelectedAppointment] =
     useState<Appointment | null>(null);
 
-  const [status, setStatus] =
-    useState<StatusFilter>("all");
-
+  const [status, setStatus] = useState<StatusFilter>("all");
   const [search, setSearch] = useState("");
+  const [dateRange, setDateRange] = useState<DateRange>("today");
+
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [actionLoading, setActionLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const displayDate = useMemo(
+    () => formatDate(new Date()),
+    [],
+  );
+
+  const loadAppointments = useCallback(
+    async (cursor?: string, append = false) => {
+      if (append) {
+        setLoadingMore(true);
+      } else {
+        setLoading(true);
+      }
+
+      setError("");
+
+      try {
+        const range = getDateRange(dateRange);
+        const params = new URLSearchParams();
+
+        params.set("limit", "50");
+        params.set("from", range.from);
+        params.set("to", range.to);
+
+        const apiStatus = getApiStatus(status);
+
+        if (apiStatus) {
+          params.set("status", apiStatus);
+        }
+
+        if (search.trim()) {
+          params.set("q", search.trim());
+        }
+
+        if (cursor) {
+          params.set("cursor", cursor);
+        }
+
+        const response = await apiRequest<AppointmentPageResponse | unknown[]>(
+          `/appointments?${params.toString()}`,
+        );
+
+        const page = normalizeAppointmentPage(response);
+
+        setAppointments((current) =>
+          append ? [...current, ...page.data] : page.data,
+        );
+
+        setNextCursor(page.nextCursor ?? null);
+        setHasMore(Boolean(page.hasMore));
+      } catch (err) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Unable to load appointments.",
+        );
+      } finally {
+        setLoading(false);
+        setLoadingMore(false);
+      }
+    },
+    [apiRequest, dateRange, search, status],
+  );
+
+  useEffect(() => {
+    void loadAppointments();
+  }, [loadAppointments]);
 
   const filteredAppointments = useMemo(() => {
     const normalizedSearch = search.toLowerCase().trim();
 
-    return appointments
+    return [...appointments]
       .filter((appointment) => {
         if (
           status !== "all" &&
@@ -57,13 +190,12 @@ export default function AppointmentsPage() {
           appointment.patientName
             .toLowerCase()
             .includes(normalizedSearch) ||
-          appointment.patientId
+          appointment.patientNumber
             .toLowerCase()
             .includes(normalizedSearch)
         );
       })
       .sort((a, b) => {
-        // Checked-in patients always appear first.
         if (
           a.status === "checked_in" &&
           b.status !== "checked_in"
@@ -89,17 +221,44 @@ export default function AppointmentsPage() {
     (appointment) => appointment.status === "checked_in",
   ).length;
 
-  function handleComplete(appointment: Appointment) {
-    setAppointments((current) =>
-      current.map((item) =>
-        item.id === appointment.id
-          ? {
-              ...item,
-              status: "completed",
-            }
-          : item,
-      ),
-    );
+  async function handleComplete(appointment: Appointment) {
+    if (!appointment.visitId) {
+      setError(
+        "This appointment does not have an associated visit to complete.",
+      );
+      return;
+    }
+
+    setActionLoading(true);
+    setError("");
+
+    try {
+      await apiRequest(
+        `/doctors/me/visits/${appointment.visitId}/complete`,
+        {
+          method: "PATCH",
+        },
+      );
+
+      setAppointments((current) =>
+        current.map((item) =>
+          item.id === appointment.id
+            ? { ...item, status: "completed" }
+            : item,
+        ),
+      );
+
+      setSelectedAppointment(null);
+      await loadAppointments();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to complete this consultation.",
+      );
+    } finally {
+      setActionLoading(false);
+    }
   }
 
   function handleAddNote(appointment: Appointment) {
@@ -107,20 +266,28 @@ export default function AppointmentsPage() {
       `Quick note for ${appointment.patientName}`,
     );
 
-    if (!note?.trim()) {
-      return;
-    }
+    if (!note?.trim()) return;
 
+    // Notes remain local because no notes-saving endpoint
+    // has been provided by the backend.
     setAppointments((current) =>
       current.map((item) =>
         item.id === appointment.id
-          ? {
-              ...item,
-              notes: note.trim(),
-            }
+          ? { ...item, notes: note.trim() }
           : item,
       ),
     );
+
+    setSelectedAppointment((current) =>
+      current?.id === appointment.id
+        ? { ...current, notes: note.trim() }
+        : current,
+    );
+  }
+
+  function handleDateRangeChange(range: DateRange) {
+    setDateRange(range);
+    setNextCursor(null);
   }
 
   if (selectedAppointment) {
@@ -129,8 +296,7 @@ export default function AppointmentsPage() {
         appointment={selectedAppointment}
         onBack={() => setSelectedAppointment(null)}
         onComplete={() => {
-          handleComplete(selectedAppointment);
-          setSelectedAppointment(null);
+          void handleComplete(selectedAppointment);
         }}
       />
     );
@@ -146,62 +312,61 @@ export default function AppointmentsPage() {
           </h1>
 
           <p className="mt-1 text-sm text-[#55749c]">
-            Your schedule for today
+            Your schedule for {dateRange === "today" ? "today" : dateRange === "week" ? "this week" : "all upcoming appointments"}
           </p>
         </div>
 
         <div className="flex flex-col gap-3 sm:flex-row">
           {/* Date tabs */}
           <div className="flex overflow-hidden rounded-xl border border-[#dce8f5] bg-white shadow-sm">
-            {["Today", "This week", "All upcoming"].map(
-              (item, index) => (
-                <button
-                  key={item}
-                  type="button"
-                  className={`
-                    px-4
-                    py-2.5
-                    text-xs
-                    font-medium
-                    transition
-                    ${
-                      index === 0
-                        ? "bg-[#2d91e8] text-white"
-                        : "text-[#55749c] hover:bg-[#f1f7fe]"
-                    }
-                  `}
-                >
-                  {item}
-                </button>
-              ),
-            )}
+            {(
+              [
+                ["today", "Today"],
+                ["week", "This week"],
+                ["upcoming", "All upcoming"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => handleDateRangeChange(value)}
+                className={`
+                  px-4 py-2.5 text-xs font-medium transition
+                  ${
+                    dateRange === value
+                      ? "bg-[#2d91e8] text-white"
+                      : "text-[#55749c] hover:bg-[#f1f7fe]"
+                  }
+                `}
+              >
+                {label}
+              </button>
+            ))}
           </div>
 
-          {/* Date picker */}
-          <button
-            type="button"
-            className="flex h-[42px] items-center justify-between gap-3 rounded-xl border border-[#dce8f5] bg-white px-4 text-xs font-medium text-[#294b76] shadow-sm"
-          >
+          {/* Current date */}
+          <div className="flex h-[42px] items-center justify-between gap-3 rounded-xl border border-[#dce8f5] bg-white px-4 text-xs font-medium text-[#294b76] shadow-sm">
             <CalendarDays
               size={16}
               className="text-[#1677d2]"
             />
 
-            <span>Tue, Sep 16, 2025</span>
+            <span>{displayDate}</span>
 
             <ChevronDown size={15} />
-          </button>
+          </div>
 
-          {/* New appointment */}
-          <button
-            type="button"
-            className="flex h-[42px] items-center justify-center gap-2 rounded-xl bg-[#2d91e8] px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#187fd8] focus:outline-none focus:ring-2 focus:ring-[#2d91e8]/40"
-          >
-            <Plus size={18} />
-            New Appointment
-          </button>
+          {/* Existing booking action is not connected to a doctor-side
+              booking form, so it is left out rather than showing an
+              action that does nothing. */}
         </div>
       </div>
+
+      {error && (
+        <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {error}
+        </div>
+      )}
 
       {/* Main layout */}
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_315px]">
@@ -215,12 +380,35 @@ export default function AppointmentsPage() {
           />
 
           <div className="mt-5">
-            <AppointmentList
-              appointments={filteredAppointments}
-              onOpen={setSelectedAppointment}
-              onAddNote={handleAddNote}
-              onComplete={handleComplete}
-            />
+            {loading ? (
+              <div className="rounded-2xl border border-[#e3edf8] bg-white p-8 text-center text-sm text-[#55749c]">
+                Loading appointments...
+              </div>
+            ) : (
+              <>
+                <AppointmentList
+                  appointments={filteredAppointments}
+                  onOpen={setSelectedAppointment}
+                  onAddNote={handleAddNote}
+                  onComplete={handleComplete}
+                />
+
+                {hasMore && nextCursor && (
+                  <div className="mt-4 flex justify-center">
+                    <button
+                      type="button"
+                      disabled={loadingMore}
+                      onClick={() => {
+                        void loadAppointments(nextCursor, true);
+                      }}
+                      className="rounded-xl border border-[#dce8f5] bg-white px-5 py-2.5 text-sm font-semibold text-[#1677d2] transition hover:bg-[#f1f7fe] disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {loadingMore ? "Loading..." : "Load more"}
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </main>
 
@@ -238,14 +426,13 @@ export default function AppointmentsPage() {
                 "Order Lab Tests",
                 "Prescribe Medication",
               ].map((action) => (
-                <button
+                <div
                   key={action}
-                  type="button"
-                  className="flex w-full items-center justify-between rounded-xl border border-[#e4edf7] px-4 py-3 text-left text-sm font-medium text-[#294b76] transition hover:bg-[#f5f9ff]"
+                  className="flex w-full items-center justify-between rounded-xl border border-[#e4edf7] px-4 py-3 text-left text-sm font-medium text-[#7891b1]"
                 >
                   <span>{action}</span>
-                  <span className="text-[#7b99ba]">›</span>
-                </button>
+                  <span>›</span>
+                </div>
               ))}
             </div>
           </section>
@@ -254,24 +441,11 @@ export default function AppointmentsPage() {
           <section className="rounded-2xl border border-[#e3edf8] bg-white p-5 shadow-[0_4px_18px_rgba(28,73,125,0.04)]">
             <div className="flex items-center justify-between">
               <h2 className="font-semibold text-[#102f5f]">
-                September 2025
+                {new Date().toLocaleDateString("en-GB", {
+                  month: "long",
+                  year: "numeric",
+                })}
               </h2>
-
-              <div className="flex gap-1">
-                <button
-                  type="button"
-                  className="rounded-lg p-1.5 text-[#7891b1] hover:bg-[#f1f7fe]"
-                >
-                  ‹
-                </button>
-
-                <button
-                  type="button"
-                  className="rounded-lg p-1.5 text-[#7891b1] hover:bg-[#f1f7fe]"
-                >
-                  ›
-                </button>
-              </div>
             </div>
 
             <div className="mt-5 grid grid-cols-7 gap-y-3 text-center">
@@ -292,33 +466,53 @@ export default function AppointmentsPage() {
                 </span>
               ))}
 
-              {Array.from({ length: 30 }, (_, index) => {
-                const day = index + 1;
+              {(() => {
+                const today = new Date();
+                const year = today.getFullYear();
+                const month = today.getMonth();
+                const firstDay = new Date(year, month, 1);
+                const daysInMonth = new Date(
+                  year,
+                  month + 1,
+                  0,
+                ).getDate();
+
+                // Convert Sunday-first JS day to Monday-first.
+                const offset = (firstDay.getDay() + 6) % 7;
 
                 return (
-                  <button
-                    key={day}
-                    type="button"
-                    className={`
-                      mx-auto
-                      flex
-                      h-8
-                      w-8
-                      items-center
-                      justify-center
-                      rounded-full
-                      text-xs
-                      ${
-                        day === 16
-                          ? "bg-[#2d91e8] font-semibold text-white"
-                          : "text-[#456486] hover:bg-[#edf6ff]"
-                      }
-                    `}
-                  >
-                    {day}
-                  </button>
+                  <>
+                    {Array.from({ length: offset }, (_, index) => (
+                      <span key={`empty-${index}`} />
+                    ))}
+
+                    {Array.from(
+                      { length: daysInMonth },
+                      (_, index) => {
+                        const day = index + 1;
+                        const isToday = day === today.getDate();
+
+                        return (
+                          <span
+                            key={day}
+                            className={`
+                              mx-auto flex h-8 w-8 items-center
+                              justify-center rounded-full text-xs
+                              ${
+                                isToday
+                                  ? "bg-[#2d91e8] font-semibold text-white"
+                                  : "text-[#456486]"
+                              }
+                            `}
+                          >
+                            {day}
+                          </span>
+                        );
+                      },
+                    )}
+                  </>
                 );
-              })}
+              })()}
             </div>
           </section>
 
@@ -336,15 +530,18 @@ export default function AppointmentsPage() {
               Contact support for any issues or assistance.
             </p>
 
-            <button
-              type="button"
-              className="mt-4 text-sm font-semibold text-[#1677d2]"
-            >
+            <span className="mt-4 inline-block text-sm font-semibold text-[#1677d2]">
               Get Support →
-            </button>
+            </span>
           </section>
         </aside>
       </div>
+
+      {actionLoading && (
+        <div className="fixed bottom-5 right-5 rounded-xl bg-[#102f5f] px-4 py-3 text-sm font-medium text-white shadow-lg">
+          Updating consultation...
+        </div>
+      )}
     </div>
   );
 }

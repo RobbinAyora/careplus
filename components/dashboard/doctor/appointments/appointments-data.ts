@@ -1,157 +1,180 @@
+
+export type AppointmentStatus =
+  | "scheduled"
+  | "confirmed"
+  | "checked_in"
+  | "completed"
+  | "no_show"
+  | "cancelled";
+
 export interface Appointment {
   id: string;
   patientId: string;
+  patientNumber: string;
   patientName: string;
-  age: number;
-  sex: "Male" | "Female";
+  age: number | null;
+  sex: string;
   doctorId: string;
+  doctorName: string;
   scheduledAt: string;
+  endAt?: string;
+  durationMinutes: number;
   reason: string;
-  status:
-    | "scheduled"
-    | "checked_in"
-    | "in_progress"
-    | "completed"
-    | "no_show"
-    | "cancelled";
+  status: AppointmentStatus;
+  version: number;
+  visitId?: string | null;
   notes?: string;
 }
 
-export const appointments: Appointment[] = [
-  {
-    id: "APT-001",
-    patientId: "#P-00123",
-    patientName: "Grace Wanjiku",
-    age: 45,
-    sex: "Female",
-    doctorId: "DOC-001",
-    scheduledAt: "2025-09-16T08:20:00",
-    reason: "Post-operative follow up",
-    status: "checked_in",
-  },
-  {
-    id: "APT-002",
-    patientId: "#P-00124",
-    patientName: "David Otieno",
-    age: 52,
-    sex: "Male",
-    doctorId: "DOC-001",
-    scheduledAt: "2025-09-16T09:05:00",
-    reason: "Hypertension review",
-    status: "checked_in",
-  },
-  {
-    id: "APT-003",
-    patientId: "#P-00125",
-    patientName: "Amina Yusuf",
-    age: 32,
-    sex: "Female",
-    doctorId: "DOC-001",
-    scheduledAt: "2025-09-16T10:00:00",
-    reason: "Consultation",
-    status: "in_progress",
-  },
-  {
-    id: "APT-004",
-    patientId: "#P-00126",
-    patientName: "Peter Kamau",
-    age: 60,
-    sex: "Male",
-    doctorId: "DOC-001",
-    scheduledAt: "2025-09-16T11:30:00",
-    reason: "Lab results review",
-    status: "scheduled",
-  },
-  {
-    id: "APT-005",
-    patientId: "#P-00127",
-    patientName: "Faith Njeri",
-    age: 28,
-    sex: "Female",
-    doctorId: "DOC-001",
-    scheduledAt: "2025-09-16T13:00:00",
-    reason: "Consultation",
-    status: "scheduled",
-  },
-  {
-    id: "APT-006",
-    patientId: "#P-00128",
-    patientName: "John Mwangi",
-    age: 40,
-    sex: "Male",
-    doctorId: "DOC-001",
-    scheduledAt: "2025-09-16T14:30:00",
-    reason: "Follow up",
-    status: "completed",
-  },
-  {
-    id: "APT-007",
-    patientId: "#P-00129",
-    patientName: "Susan Muriithi",
-    age: 37,
-    sex: "Female",
-    doctorId: "DOC-001",
-    scheduledAt: "2025-09-16T16:00:00",
-    reason: "Consultation",
-    status: "no_show",
-  },
-  {
-    id: "APT-008",
-    patientId: "#P-00130",
-    patientName: "Brian Ochieng",
-    age: 48,
-    sex: "Male",
-    doctorId: "DOC-001",
-    scheduledAt: "2025-09-16T16:30:00",
-    reason: "Medication review",
-    status: "cancelled",
-  },
-];
+export interface AppointmentPage {
+  data: Appointment[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
 
-export const patientDetails = {
-  "#P-00123": {
-    allergies: ["Penicillin"],
-    chronicConditions: ["Hypertension"],
-    lastVisit: "02 September 2025",
-  },
-  "#P-00124": {
-    allergies: [],
-    chronicConditions: ["Hypertension"],
-    lastVisit: "28 August 2025",
-  },
-  "#P-00125": {
-    allergies: ["Sulfa drugs"],
-    chronicConditions: [],
-    lastVisit: "15 July 2025",
-  },
-  "#P-00126": {
-    allergies: [],
-    chronicConditions: ["Type 2 Diabetes"],
-    lastVisit: "03 September 2025",
-  },
-  "#P-00127": {
-    allergies: [],
-    chronicConditions: [],
-    lastVisit: "19 August 2025",
-  },
-  "#P-00128": {
-    allergies: [],
-    chronicConditions: ["Asthma"],
-    lastVisit: "01 September 2025",
-  },
-  "#P-00129": {
-    allergies: [],
-    chronicConditions: [],
-    lastVisit: "11 August 2025",
-  },
-  "#P-00130": {
-    allergies: ["Aspirin"],
-    chronicConditions: [],
-    lastVisit: "22 August 2025",
-  },
-};
+type UnknownRecord = Record<string, unknown>;
 
-export function getAppointments(): Promise<Appointment[]> {
-  // Replace this function with your API call later.
-  return Promise.resolve(appointments);
+function asRecord(value: unknown): UnknownRecord {
+  return value && typeof value === "object"
+    ? (value as UnknownRecord)
+    : {};
+}
+
+function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function calculateAge(dateOfBirth: unknown): number | null {
+  if (typeof dateOfBirth !== "string") return null;
+
+  const birthDate = new Date(dateOfBirth);
+
+  if (Number.isNaN(birthDate.getTime())) return null;
+
+  const today = new Date();
+  let age = today.getFullYear() - birthDate.getFullYear();
+
+  const monthDifference = today.getMonth() - birthDate.getMonth();
+
+  if (
+    monthDifference < 0 ||
+    (monthDifference === 0 && today.getDate() < birthDate.getDate())
+  ) {
+    age--;
+  }
+
+  return age >= 0 ? age : null;
+}
+
+export function normalizeAppointmentStatus(
+  value: unknown,
+): AppointmentStatus {
+  switch (String(value ?? "").toUpperCase()) {
+    case "CONFIRMED":
+      return "confirmed";
+    case "CHECKED_IN":
+      return "checked_in";
+    case "COMPLETED":
+      return "completed";
+    case "NO_SHOW":
+      return "no_show";
+    case "CANCELLED":
+      return "cancelled";
+    case "SCHEDULED":
+    default:
+      return "scheduled";
+  }
+}
+
+export function normalizeAppointment(value: unknown): Appointment {
+  const raw = asRecord(value);
+  const patient = asRecord(raw.patient);
+  const doctor = asRecord(raw.doctor);
+
+  const firstName = asString(patient.firstName);
+  const lastName = asString(patient.lastName);
+  const otherNames = asString(patient.otherNames);
+
+  const patientName = [firstName, otherNames, lastName]
+    .filter(Boolean)
+    .join(" ");
+
+  const dateOfBirth = patient.dateOfBirth;
+  const estimatedAge = patient.estimatedAgeYears;
+
+  const age =
+    typeof estimatedAge === "number"
+      ? estimatedAge
+      : calculateAge(dateOfBirth);
+
+  const doctorName = [
+    asString(doctor.firstName),
+    asString(doctor.lastName),
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return {
+    id: asString(raw.id),
+    patientId: asString(raw.patientId ?? patient.id),
+    patientNumber: asString(patient.patientNumber, "Patient"),
+    patientName: patientName || "Unknown patient",
+    age,
+    sex: asString(patient.sex, "Not specified"),
+    doctorId: asString(raw.doctorId ?? doctor.id),
+    doctorName: doctorName || "Assigned doctor",
+    scheduledAt: asString(raw.scheduledAt),
+    endAt: asString(raw.endAt) || undefined,
+    durationMinutes:
+      typeof raw.durationMinutes === "number"
+        ? raw.durationMinutes
+        : 30,
+    reason: asString(raw.reason, "Consultation"),
+    status: normalizeAppointmentStatus(raw.status),
+    version: typeof raw.version === "number" ? raw.version : 1,
+    visitId:
+      typeof raw.visitId === "string" ? raw.visitId : null,
+  };
+}
+
+export function normalizeAppointmentPage(
+  response: unknown,
+): AppointmentPage {
+  const raw = asRecord(response);
+
+  const rows = Array.isArray(response)
+    ? response
+    : Array.isArray(raw.data)
+      ? raw.data
+      : Array.isArray(raw.items)
+        ? raw.items
+        : [];
+
+  return {
+    data: rows.map(normalizeAppointment),
+    nextCursor:
+      typeof raw.nextCursor === "string" ? raw.nextCursor : null,
+    hasMore: raw.hasMore === true,
+  };
+}
+
+export function toBackendAppointmentStatus(
+  status: string,
+): string | undefined {
+  switch (status) {
+    case "scheduled":
+      return "SCHEDULED";
+    case "confirmed":
+      return "CONFIRMED";
+    case "checked_in":
+      return "CHECKED_IN";
+    case "completed":
+      return "COMPLETED";
+    case "no_show":
+      return "NO_SHOW";
+    case "cancelled":
+      return "CANCELLED";
+    default:
+      return undefined;
+  }
 }

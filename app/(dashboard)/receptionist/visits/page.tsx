@@ -3,11 +3,41 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/lib/auth/session";
+import { useApiClient } from "@/lib/api/client";
 
-const API_URL = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 const PAGE_SIZE = 20;
 
 type VisitType = "OUTPATIENT" | "EMERGENCY" | "FOLLOW_UP";
+
+type VisitCloseReason =
+  | "LEFT_WITHOUT_BEING_SEEN"
+  | "REGISTERED_IN_ERROR"
+  | "DUPLICATE"
+  | "REFERRED_ELSEWHERE"
+  | "OTHER";
+
+const CLOSE_REASON_OPTIONS: { value: VisitCloseReason; label: string }[] = [
+  {
+    value: "LEFT_WITHOUT_BEING_SEEN",
+    label: "Patient left without being seen",
+  },
+  {
+    value: "REGISTERED_IN_ERROR",
+    label: "Registered in error",
+  },
+  {
+    value: "DUPLICATE",
+    label: "Duplicate visit",
+  },
+  {
+    value: "REFERRED_ELSEWHERE",
+    label: "Referred elsewhere",
+  },
+  {
+    value: "OTHER",
+    label: "Other",
+  },
+];
 
 type Patient = {
   id: string;
@@ -36,6 +66,12 @@ type Visit = {
 type Toast = {
   type: "success" | "error";
   message: string;
+};
+
+type VisitPage = {
+  visits: Visit[];
+  nextCursor: string | null;
+  hasMore: boolean;
 };
 
 function getPatientName(patient?: Patient) {
@@ -89,26 +125,29 @@ function formatDate(date?: string) {
   });
 }
 
-function extractVisits(data: unknown): {
-  visits: Visit[];
-  total: number;
-  totalPages: number;
-} {
+function extractVisits(data: unknown): VisitPage {
   if (Array.isArray(data)) {
     return {
       visits: data as Visit[],
-      total: data.length,
-      totalPages: 1,
+      nextCursor: null,
+      hasMore: false,
     };
   }
 
   if (!data || typeof data !== "object") {
-    return { visits: [], total: 0, totalPages: 1 };
+    return {
+      visits: [],
+      nextCursor: null,
+      hasMore: false,
+    };
   }
 
   const response = data as Record<string, unknown>;
+
   const nested =
-    response.data && typeof response.data === "object"
+    response.data &&
+    typeof response.data === "object" &&
+    !Array.isArray(response.data)
       ? (response.data as Record<string, unknown>)
       : response;
 
@@ -116,17 +155,29 @@ function extractVisits(data: unknown): {
     ? (nested.visits as Visit[])
     : Array.isArray(nested.data)
       ? (nested.data as Visit[])
-      : [];
+      : Array.isArray(response.data)
+        ? (response.data as Visit[])
+        : [];
 
-  const total =
-    typeof nested.total === "number" ? nested.total : visits.length;
+  const nextCursor =
+    typeof nested.nextCursor === "string"
+      ? nested.nextCursor
+      : typeof response.nextCursor === "string"
+        ? response.nextCursor
+        : null;
 
-  const totalPages =
-    typeof nested.totalPages === "number"
-      ? nested.totalPages
-      : Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const hasMore =
+    typeof nested.hasMore === "boolean"
+      ? nested.hasMore
+      : typeof response.hasMore === "boolean"
+        ? response.hasMore
+        : false;
 
-  return { visits, total, totalPages };
+  return {
+    visits,
+    nextCursor,
+    hasMore,
+  };
 }
 
 function extractPatients(data: unknown): Patient[] {
@@ -159,37 +210,18 @@ function extractPatients(data: unknown): Patient[] {
   return [];
 }
 
-async function getErrorMessage(response: Response) {
-  try {
-    const data: unknown = await response.json();
-
-    if (data && typeof data === "object") {
-      const errorData = data as {
-        message?: string | string[];
-        error?: string;
-      };
-
-      if (Array.isArray(errorData.message)) {
-        return errorData.message.join(", ");
-      }
-
-      if (errorData.message) return errorData.message;
-      if (errorData.error) return errorData.error;
-    }
-  } catch {
-    // Use the fallback message if the response is not JSON.
-  }
-
-  return `Request failed with status ${response.status}`;
-}
-
 export default function VisitsPage() {
-  const { accessToken } = useAuth();
+  const { isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
   const [visits, setVisits] = useState<Visit[]>([]);
-  const [total, setTotal] = useState(0);
-  const [totalPages, setTotalPages] = useState(1);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+
   const [page, setPage] = useState(1);
+  const [cursorHistory, setCursorHistory] = useState<(string | null)[]>([
+    null,
+  ]);
 
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
@@ -210,6 +242,14 @@ export default function VisitsPage() {
   const [creatingVisit, setCreatingVisit] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
 
+  // Cancel visit state
+  const [showCancelVisit, setShowCancelVisit] = useState(false);
+  const [selectedVisit, setSelectedVisit] = useState<Visit | null>(null);
+  const [closeReason, setCloseReason] =
+    useState<VisitCloseReason>("LEFT_WITHOUT_BEING_SEEN");
+  const [closeNote, setCloseNote] = useState("");
+  const [closingVisit, setClosingVisit] = useState(false);
+
   const showToast = useCallback(
     (type: Toast["type"], message: string) => {
       setToast({ type, message });
@@ -222,19 +262,12 @@ export default function VisitsPage() {
   );
 
   const fetchVisits = useCallback(
-    async (requestedPage = page, showRefresh = false) => {
-      if (!accessToken) {
-        setLoading(false);
-        setRefreshing(false);
-        return;
-      }
-
-      if (!API_URL) {
-        showToast("error", "API URL is not configured.");
-        setLoading(false);
-        setRefreshing(false);
-        return;
-      }
+    async (
+      cursor: string | null = null,
+      requestedPage = 1,
+      showRefresh = false
+    ) => {
+      if (!isSessionLoaded) return;
 
       if (showRefresh) {
         setRefreshing(true);
@@ -244,34 +277,26 @@ export default function VisitsPage() {
 
       try {
         const params = new URLSearchParams({
-          page: String(requestedPage),
           limit: String(PAGE_SIZE),
         });
+
+        if (cursor) {
+          params.set("cursor", cursor);
+        }
 
         if (search.trim()) {
           params.set("q", search.trim());
         }
 
-        const response = await fetch(
-          `${API_URL}/patients/visits?${params.toString()}`,
-          {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-            },
-            cache: "no-store",
-          }
+        const data = await apiRequest<unknown>(
+          `/patients/visits?${params.toString()}`
         );
 
-        if (!response.ok) {
-          throw new Error(await getErrorMessage(response));
-        }
-
-        const data: unknown = await response.json();
         const result = extractVisits(data);
 
         setVisits(result.visits);
-        setTotal(result.total);
-        setTotalPages(Math.max(1, result.totalPages));
+        setNextCursor(result.nextCursor);
+        setHasMore(result.hasMore);
         setPage(requestedPage);
       } catch (error) {
         showToast(
@@ -283,32 +308,35 @@ export default function VisitsPage() {
         setRefreshing(false);
       }
     },
-    [accessToken, page, search, showToast]
+    [apiRequest, isSessionLoaded, search, showToast]
   );
 
   useEffect(() => {
-    if (!accessToken) return;
+    if (!isSessionLoaded) return;
 
     const timeout = window.setTimeout(() => {
-      fetchVisits(1);
+      setCursorHistory([null]);
+      void fetchVisits(null, 1);
     }, 350);
 
     return () => window.clearTimeout(timeout);
-  }, [accessToken, search, fetchVisits]);
+  }, [isSessionLoaded, search, fetchVisits]);
 
   // Search existing registered patients when creating a visit.
   useEffect(() => {
+    if (!isSessionLoaded) return;
+
     if (!showNewVisit || selectedPatient || patientSearch.trim().length < 2) {
       setPatientResults([]);
       setSearchingPatients(false);
       return;
     }
 
-    if (!accessToken || !API_URL) return;
-
-    const controller = new AbortController();
+    let cancelled = false;
 
     const timeout = window.setTimeout(async () => {
+      if (cancelled) return;
+
       setSearchingPatients(true);
 
       try {
@@ -316,43 +344,36 @@ export default function VisitsPage() {
           q: patientSearch.trim(),
         });
 
-        const response = await fetch(
-          `${API_URL}/patients/search?${params.toString()}`,
-          {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-            },
-            cache: "no-store",
-            signal: controller.signal,
-          }
+        const data = await apiRequest<unknown>(
+          `/patients/search?${params.toString()}`
         );
 
-        if (!response.ok) {
-          throw new Error(await getErrorMessage(response));
+        if (!cancelled) {
+          setPatientResults(extractPatients(data));
         }
-
-        const data: unknown = await response.json();
-        setPatientResults(extractPatients(data));
       } catch (error) {
-        if (error instanceof Error && error.name === "AbortError") return;
-
-        showToast(
-          "error",
-          error instanceof Error
-            ? error.message
-            : "Unable to search patients."
-        );
+        if (!cancelled) {
+          showToast(
+            "error",
+            error instanceof Error
+              ? error.message
+              : "Unable to search patients."
+          );
+        }
       } finally {
-        setSearchingPatients(false);
+        if (!cancelled) {
+          setSearchingPatients(false);
+        }
       }
     }, 350);
 
     return () => {
+      cancelled = true;
       window.clearTimeout(timeout);
-      controller.abort();
     };
   }, [
-    accessToken,
+    apiRequest,
+    isSessionLoaded,
     patientSearch,
     selectedPatient,
     showNewVisit,
@@ -390,6 +411,96 @@ export default function VisitsPage() {
     resetNewVisitForm();
   }
 
+  // Open cancellation modal
+  function openCancelVisitModal(visit: Visit) {
+    setSelectedVisit(visit);
+    setCloseReason("LEFT_WITHOUT_BEING_SEEN");
+    setCloseNote("");
+    setShowCancelVisit(true);
+  }
+
+  // Close cancellation modal
+  function closeCancelVisitModal() {
+    if (closingVisit) return;
+
+    setShowCancelVisit(false);
+    setSelectedVisit(null);
+    setCloseReason("LEFT_WITHOUT_BEING_SEEN");
+    setCloseNote("");
+  }
+
+  // Cancel visit using the backend endpoint
+  async function handleCloseVisit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!selectedVisit) return;
+
+    if (closeReason === "OTHER" && !closeNote.trim()) {
+      showToast("error", "Please provide a note when selecting Other.");
+      return;
+    }
+
+    setClosingVisit(true);
+
+    try {
+      await apiRequest<unknown>(
+        `/patients/visits/${selectedVisit.id}/close`,
+        {
+          method: "PATCH",
+          body: {
+            reason: closeReason,
+            note: closeNote.trim() || undefined,
+          },
+        }
+      );
+
+      showToast(
+        "success",
+        `Visit ${selectedVisit.visitNumber || ""} cancelled successfully.`
+      );
+
+      setShowCancelVisit(false);
+      setSelectedVisit(null);
+      setCloseReason("LEFT_WITHOUT_BEING_SEEN");
+      setCloseNote("");
+
+      // Refresh the current page after successful cancellation.
+      await fetchVisits(
+        cursorHistory[page - 1] ?? null,
+        page,
+        true
+      );
+    } catch (error) {
+      showToast(
+        "error",
+        error instanceof Error ? error.message : "Unable to cancel visit."
+      );
+    } finally {
+      setClosingVisit(false);
+    }
+  }
+
+  function goToNextPage() {
+    if (!nextCursor || !hasMore || loading || refreshing) return;
+
+    const cursor = nextCursor;
+
+    setCursorHistory((current) => [
+      ...current.slice(0, page),
+      cursor,
+    ]);
+
+    void fetchVisits(cursor, page + 1);
+  }
+
+  function goToPreviousPage() {
+    if (page <= 1 || loading || refreshing) return;
+
+    const previousCursor = cursorHistory[page - 2] ?? null;
+
+    void fetchVisits(previousCursor, page - 1);
+  }
+
   // Create a new visit for an already registered patient.
   async function handleCreateVisit(
     event: React.FormEvent<HTMLFormElement>
@@ -406,56 +517,30 @@ export default function VisitsPage() {
       return;
     }
 
-    if (!accessToken || !API_URL) {
+    if (!isSessionLoaded) {
       showToast(
         "error",
-        "You are not authenticated or the API URL is missing."
+        "Your session is still loading. Please try again."
       );
       return;
     }
 
     const patientId = selectedPatient.id;
-    const requestUrl = `${API_URL}/patients/${patientId}/visits`;
-
-    // Debugging information: inspect these values in the browser console.
-    console.log("Creating visit for:", selectedPatient);
-    console.log("Selected patient database ID:", patientId);
-    console.log("POST URL:", requestUrl);
 
     setCreatingVisit(true);
 
     try {
-      const response = await fetch(requestUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          visitType,
-          department: department.trim() || undefined,
-          reasonForVisit: reasonForVisit.trim() || undefined,
-        }),
-      });
-
-      const responseData: unknown = await response.json();
-
-      console.log("Create visit response:", responseData);
-
-      if (!response.ok) {
-        const message =
-          responseData &&
-          typeof responseData === "object" &&
-          "message" in responseData
-            ? (responseData as {
-                message: string | string[];
-              }).message
-            : "Unable to create visit.";
-
-        throw new Error(
-          Array.isArray(message) ? message.join(", ") : message
-        );
-      }
+      await apiRequest<unknown>(
+        `/patients/${patientId}/visits`,
+        {
+          method: "POST",
+          body: {
+            visitType,
+            department: department.trim() || undefined,
+            reasonForVisit: reasonForVisit.trim() || undefined,
+          },
+        }
+      );
 
       showToast(
         "success",
@@ -465,11 +550,10 @@ export default function VisitsPage() {
       setShowNewVisit(false);
       resetNewVisitForm();
 
-      // Reload the visits table so the newly created visit appears.
-      await fetchVisits(1, true);
+      // Reload the first page so the newly created visit can appear.
+      setCursorHistory([null]);
+      await fetchVisits(null, 1, true);
     } catch (error) {
-      console.error("Create visit error:", error);
-
       showToast(
         "error",
         error instanceof Error ? error.message : "Unable to create visit."
@@ -499,7 +583,13 @@ export default function VisitsPage() {
           <div className="flex flex-wrap gap-3">
             <button
               type="button"
-              onClick={() => fetchVisits(page, true)}
+              onClick={() =>
+                fetchVisits(
+                  cursorHistory[page - 1] ?? null,
+                  page,
+                  true
+                )
+              }
               disabled={refreshing || loading}
               className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
             >
@@ -519,9 +609,11 @@ export default function VisitsPage() {
         {/* Summary cards */}
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-            <p className="text-sm font-medium text-slate-500">Total visits</p>
+            <p className="text-sm font-medium text-slate-500">
+              Visits on this page
+            </p>
             <p className="mt-2 text-3xl font-bold text-slate-900">
-              {total}
+              {visits.length}
             </p>
             <p className="mt-1 text-xs text-slate-400">
               Registered patient visits
@@ -575,7 +667,7 @@ export default function VisitsPage() {
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[950px] text-left">
+            <table className="w-full min-w-[1050px] text-left">
               <thead className="bg-slate-50">
                 <tr className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                   <th className="px-5 py-4">Visit details</th>
@@ -585,6 +677,7 @@ export default function VisitsPage() {
                   <th className="px-5 py-4">Status</th>
                   <th className="px-5 py-4">Priority</th>
                   <th className="px-5 py-4">Date registered</th>
+                  <th className="px-5 py-4">Actions</th>
                 </tr>
               </thead>
 
@@ -592,7 +685,7 @@ export default function VisitsPage() {
                 {loading ? (
                   <tr>
                     <td
-                      colSpan={7}
+                      colSpan={8}
                       className="px-5 py-12 text-center text-sm text-slate-500"
                     >
                       Loading visits...
@@ -600,7 +693,7 @@ export default function VisitsPage() {
                   </tr>
                 ) : visits.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-5 py-12 text-center">
+                    <td colSpan={8} className="px-5 py-12 text-center">
                       <p className="font-semibold text-slate-700">
                         No visits found
                       </p>
@@ -666,6 +759,21 @@ export default function VisitsPage() {
                       <td className="px-5 py-4 text-sm text-slate-600">
                         {formatDate(visit.createdAt)}
                       </td>
+
+                      <td className="px-5 py-4">
+                        {visit.status !== "CANCELLED" &&
+                        visit.status !== "COMPLETED" ? (
+                          <button
+                            type="button"
+                            onClick={() => openCancelVisitModal(visit)}
+                            className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-100"
+                          >
+                            Cancel Visit
+                          </button>
+                        ) : (
+                          <span className="text-xs text-slate-400">—</span>
+                        )}
+                      </td>
                     </tr>
                   ))
                 )}
@@ -676,28 +784,27 @@ export default function VisitsPage() {
           {/* Pagination */}
           <div className="flex flex-col gap-3 border-t border-slate-100 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
             <p className="text-sm text-slate-500">
-              Showing {visits.length === 0 ? 0 : (page - 1) * PAGE_SIZE + 1}
-              {" "}to {(page - 1) * PAGE_SIZE + visits.length} of {total} visits
+              Showing {visits.length} visits on this page
             </p>
 
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                disabled={page <= 1 || loading}
-                onClick={() => fetchVisits(page - 1)}
+                disabled={page <= 1 || loading || refreshing}
+                onClick={goToPreviousPage}
                 className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Previous
               </button>
 
               <span className="px-2 text-sm text-slate-600">
-                Page {page} of {totalPages}
+                Page {page}
               </span>
 
               <button
                 type="button"
-                disabled={page >= totalPages || loading}
-                onClick={() => fetchVisits(page + 1)}
+                disabled={!hasMore || !nextCursor || loading || refreshing}
+                onClick={goToNextPage}
                 className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Next
@@ -803,13 +910,6 @@ export default function VisitsPage() {
                               key={patient.id}
                               type="button"
                               onClick={() => {
-                                // Debugging information for the selected patient.
-                                console.log("Selected patient:", patient);
-                                console.log(
-                                  "Selected patient database ID:",
-                                  patient.id
-                                );
-
                                 setSelectedPatient(patient);
                                 setPatientSearch("");
                                 setPatientResults([]);
@@ -935,6 +1035,159 @@ export default function VisitsPage() {
         </div>
       )}
 
+      {/* Cancel visit modal */}
+      {showCancelVisit && selectedVisit && (
+        <div
+          className="fixed inset-0 z-[55] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              closeCancelVisitModal();
+            }
+          }}
+        >
+          <div className="my-auto w-full max-w-lg overflow-hidden rounded-2xl bg-white shadow-2xl">
+            <div className="flex items-start justify-between border-b border-slate-100 px-6 py-5">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wider text-red-600">
+                  Visit management
+                </p>
+                <h2 className="mt-1 text-xl font-bold text-slate-900">
+                  Cancel patient visit
+                </h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  Provide a reason for closing this visit.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={closeCancelVisitModal}
+                disabled={closingVisit}
+                aria-label="Close"
+                className="rounded-lg px-3 py-2 text-xl text-slate-400 hover:bg-slate-100 hover:text-slate-700 disabled:opacity-40"
+              >
+                ×
+              </button>
+            </div>
+
+            <form onSubmit={handleCloseVisit} className="space-y-5 p-6">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                  Patient
+                </p>
+                <p className="mt-1 font-semibold text-slate-900">
+                  {getPatientName(selectedVisit.patient)}
+                </p>
+
+                <p className="mt-2 text-xs text-slate-500">
+                  Visit No: {selectedVisit.visitNumber || "—"}
+                </p>
+
+                <p className="mt-1 text-xs text-slate-500">
+                  Current status: {formatStatus(selectedVisit.status)}
+                </p>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="closeReason"
+                  className="mb-2 block text-sm font-semibold text-slate-700"
+                >
+                  Reason for cancellation{" "}
+                  <span className="text-red-500">*</span>
+                </label>
+
+                <select
+                  id="closeReason"
+                  value={closeReason}
+                  onChange={(event) =>
+                    setCloseReason(event.target.value as VisitCloseReason)
+                  }
+                  required
+                  disabled={closingVisit}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 disabled:opacity-60"
+                >
+                  {CLOSE_REASON_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="closeNote"
+                  className="mb-2 block text-sm font-semibold text-slate-700"
+                >
+                  Additional note{" "}
+                  {closeReason === "OTHER" ? (
+                    <span className="text-red-500">*</span>
+                  ) : (
+                    <span className="font-normal text-slate-400">
+                      (Optional)
+                    </span>
+                  )}
+                </label>
+
+                <textarea
+                  id="closeNote"
+                  value={closeNote}
+                  onChange={(event) => setCloseNote(event.target.value)}
+                  rows={3}
+                  maxLength={500}
+                  required={closeReason === "OTHER"}
+                  disabled={closingVisit}
+                  placeholder={
+                    closeReason === "OTHER"
+                      ? "Please explain why this visit is being closed..."
+                      : "Add any additional information..."
+                  }
+                  className="w-full resize-none rounded-xl border border-slate-200 px-4 py-3 text-sm text-slate-800 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 disabled:opacity-60"
+                />
+
+                <p className="mt-1 text-right text-xs text-slate-400">
+                  {closeNote.length}/500 characters
+                </p>
+              </div>
+
+              <div className="rounded-xl border border-red-100 bg-red-50 p-4">
+                <p className="text-sm font-semibold text-red-800">
+                  Confirm visit cancellation
+                </p>
+                <p className="mt-1 text-xs leading-5 text-red-700">
+                  This action will close the visit and update its status.
+                  Please ensure the selected reason is correct before
+                  proceeding.
+                </p>
+              </div>
+
+              <div className="flex flex-col-reverse gap-3 border-t border-slate-100 pt-5 sm:flex-row sm:justify-end">
+                <button
+                  type="button"
+                  onClick={closeCancelVisitModal}
+                  disabled={closingVisit}
+                  className="rounded-xl border border-slate-200 px-5 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  Go Back
+                </button>
+
+                <button
+                  type="submit"
+                  disabled={
+                    closingVisit ||
+                    (closeReason === "OTHER" && !closeNote.trim())
+                  }
+                  className="rounded-xl bg-red-600 px-6 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {closingVisit ? "Cancelling visit..." : "Confirm Cancellation"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Toast notification */}
       {toast && (
         <div
@@ -949,5 +1202,7 @@ export default function VisitsPage() {
     </div>
   );
 }
+
+
 
 

@@ -1,3 +1,4 @@
+
 "use client";
 
 import { useState, type FormEvent } from "react";
@@ -24,9 +25,9 @@ const SLIDES: CarouselSlide[] = [
 
 export default function LoginPage() {
   const router = useRouter();
-  const { login } = useAuth();
+  const { login, logout } = useAuth();
+
   const [showPassword, setShowPassword] = useState(false);
-  const [rememberMe, setRememberMe] = useState(true);
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -37,11 +38,12 @@ export default function LoginPage() {
     setError(null);
 
     if (!identifier.trim() || !password) {
-      setError("Enter your email/username and password to continue.");
+      setError("Enter your email address and password to continue.");
       return;
     }
 
     setIsSubmitting(true);
+
     try {
       const result = await authenticate(identifier, password);
 
@@ -49,12 +51,28 @@ export default function LoginPage() {
         setError(result.error);
       } else {
         login(result.session);
+
         if (result.session.user.mustChangePassword) {
           router.push("/change-password");
         } else {
-          router.push(DASHBOARD_PATHS[result.session.user.role]);
+          const dashboardPath =
+            DASHBOARD_PATHS[result.session.user.role];
+
+          if (!dashboardPath) {
+            await logout();
+
+            setError(
+              "Your account does not have a configured dashboard yet. Contact support.",
+            );
+
+            return;
+          }
+
+          router.push(dashboardPath);
         }
       }
+    } catch {
+      setError("Something went wrong. Please try again.");
     } finally {
       setIsSubmitting(false);
     }
@@ -90,16 +108,18 @@ export default function LoginPage() {
           <form onSubmit={handleSubmit} className="mt-8 space-y-4" noValidate>
             <div>
               <label htmlFor="identifier" className="sr-only">
-                Email or Username
+                Email Address
               </label>
+
               <div className="flex items-center rounded-xl border border-slate-200 bg-white px-4 py-3 focus-within:border-brand-blue focus-within:ring-1 focus-within:ring-brand-blue">
                 <UserIcon className="h-5 w-5 text-slate-400" />
+
                 <input
                   id="identifier"
-                  name="identifier"
-                  type="text"
-                  autoComplete="username"
-                  placeholder="Email or Username"
+                  name="email"
+                  type="email"
+                  autoComplete="email"
+                  placeholder="Email Address"
                   value={identifier}
                   onChange={(e) => setIdentifier(e.target.value)}
                   className="ml-3 w-full bg-transparent text-brand-navy placeholder:text-slate-400 focus:outline-none"
@@ -111,8 +131,10 @@ export default function LoginPage() {
               <label htmlFor="password" className="sr-only">
                 Password
               </label>
+
               <div className="flex items-center rounded-xl border border-slate-200 bg-white px-4 py-3 focus-within:border-brand-blue focus-within:ring-1 focus-within:ring-brand-blue">
                 <LockIcon className="h-5 w-5 text-slate-400" />
+
                 <input
                   id="password"
                   name="password"
@@ -123,6 +145,7 @@ export default function LoginPage() {
                   onChange={(e) => setPassword(e.target.value)}
                   className="ml-3 w-full bg-transparent text-brand-navy placeholder:text-slate-400 focus:outline-none"
                 />
+
                 <button
                   type="button"
                   onClick={() => setShowPassword((v) => !v)}
@@ -141,16 +164,7 @@ export default function LoginPage() {
               </p>
             )}
 
-            <div className="flex items-center justify-between pt-1">
-              <label className="flex items-center gap-2 text-sm text-slate-600">
-                <input
-                  type="checkbox"
-                  checked={rememberMe}
-                  onChange={(e) => setRememberMe(e.target.checked)}
-                  className="h-4 w-4 rounded border-slate-300 text-brand-blue focus:ring-brand-blue"
-                />
-                Remember me
-              </label>
+            <div className="flex items-center justify-end pt-1">
               <a
                 href="/forgot-password"
                 className="text-sm font-medium text-brand-blue hover:underline"
@@ -185,8 +199,6 @@ export default function LoginPage() {
               Contact support
             </a>
           </p>
-
-          
         </div>
 
         {/* Footer */}
@@ -194,6 +206,7 @@ export default function LoginPage() {
           <p className="text-sm text-slate-400">
             Better Care &nbsp;•&nbsp; Healthier Communities
           </p>
+
           <div
             aria-hidden
             className="pointer-events-none absolute -bottom-10 -left-20 -z-10 h-40 w-72 rounded-full bg-brand-blue/10 blur-2xl"
@@ -278,6 +291,7 @@ function EyeIcon({ open, className }: { open: boolean; className?: string }) {
       </svg>
     );
   }
+
   return (
     <svg viewBox="0 0 24 24" fill="none" className={className}>
       <path
@@ -304,5 +318,6 @@ function ArrowRightIcon({ className }: { className?: string }) {
     </svg>
   );
 }
+
 
 

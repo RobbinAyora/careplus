@@ -1,6 +1,10 @@
+
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useAuth } from "@/lib/auth/session";
+import { useApiClient } from "@/lib/api/client";
+
 import {
   ChevronDown,
   Grid2X2,
@@ -14,10 +18,12 @@ import {
   Activity,
   Stethoscope,
   CheckCircle2,
+  RefreshCw,
 } from "lucide-react";
 
 import PatientTable from "@/components/dashboard/doctor/patients/PatientTable";
 import PatientCard from "@/components/dashboard/doctor/patients/PatientCard";
+
 import type {
   Gender,
   Patient,
@@ -46,19 +52,14 @@ interface DoctorProfileData {
   workload: DoctorWorkload;
 }
 
-interface ApiErrorResponse {
-  message?: string | string[];
-}
-
 interface AssignedPatientsPagination {
-  page: number;
+  nextCursor: string | null;
+  hasMore: boolean;
   limit: number;
-  total: number;
-  totalPages: number;
 }
 
-const SESSION_KEY = "careplus.auth-session";
 const PAGE_SIZE = 20;
+const REFRESH_INTERVAL = 30000;
 
 const DEFAULT_WORKLOAD: DoctorWorkload = {
   waitingPatients: 0,
@@ -69,10 +70,9 @@ const DEFAULT_WORKLOAD: DoctorWorkload = {
 };
 
 const DEFAULT_PAGINATION: AssignedPatientsPagination = {
-  page: 1,
+  nextCursor: null,
+  hasMore: false,
   limit: PAGE_SIZE,
-  total: 0,
-  totalPages: 1,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -101,20 +101,6 @@ function getAvailabilityStatus(
   }
 
   return null;
-}
-
-function getApiError(data: unknown, fallback: string): string {
-  if (!isRecord(data)) return fallback;
-
-  const message = (data as ApiErrorResponse).message;
-
-  if (typeof message === "string") return message;
-
-  if (Array.isArray(message)) {
-    return message.join(", ");
-  }
-
-  return fallback;
 }
 
 function parseDoctorProfile(data: unknown): DoctorProfileData {
@@ -263,9 +249,6 @@ function mapAssignedPatient(queueEntry: unknown): Patient {
     queueEntry.status ?? visit.status,
   ).toUpperCase();
 
-  // The current doctor queue contains patients awaiting consultation
-  // or already in consultation. Visit type determines the existing
-  // frontend's outpatient/admitted display status.
   const patientStatus: PatientStatus =
     visitType === "INPATIENT" ? "Admitted" : "Outpatient";
 
@@ -315,20 +298,23 @@ function mapAssignedPatient(queueEntry: unknown): Patient {
       priority === "EMERGENCY" ||
       priority === "URGENT" ||
       visitStatus === "REFERRED",
-
-    // Used by the existing patient filtering logic if this
-    // property is present in your Patient type.
     assignedDoctorId: getString(queueEntry.assignedDoctorId),
   } as Patient;
 }
 
 /**
- * Extracts the patient records from the API response.
+ * Extracts patient records and cursor pagination from the API response.
  *
- * Supports the common response structures:
- * { data: [], pagination: {} }
- * { items: [], pagination: {} }
- * { results: [], pagination: {} }
+ * Backend response:
+ * {
+ *   message: "...",
+ *   data: [],
+ *   pagination: {
+ *     nextCursor: string | null,
+ *     hasMore: boolean,
+ *     limit: number
+ *   }
+ * }
  */
 function parseAssignedPatientsResponse(data: unknown): {
   patients: Patient[];
@@ -356,38 +342,28 @@ function parseAssignedPatientsResponse(data: unknown): {
       ? data.meta
       : data;
 
-  const page = getNumber(
-    paginationSource.page,
-    DEFAULT_PAGINATION.page,
-  );
-
-  const limit = getNumber(
-    paginationSource.limit,
-    DEFAULT_PAGINATION.limit,
-  );
-
-  const total = getNumber(
-    paginationSource.total,
-    records.length,
-  );
-
-  const totalPages = getNumber(
-    paginationSource.totalPages,
-    Math.max(1, Math.ceil(total / limit)),
-  );
-
   return {
     patients: records.map(mapAssignedPatient),
     pagination: {
-      page,
-      limit,
-      total,
-      totalPages: Math.max(1, totalPages),
+      nextCursor:
+        typeof paginationSource.nextCursor === "string"
+          ? paginationSource.nextCursor
+          : null,
+
+      hasMore: paginationSource.hasMore === true,
+
+      limit: getNumber(
+        paginationSource.limit,
+        PAGE_SIZE,
+      ),
     },
   };
 }
 
 export default function DoctorPatientsPage() {
+  const { accessToken } = useAuth();
+  const apiRequest = useApiClient();
+
   const [search, setSearch] = useState("");
 
   const [status, setStatus] = useState<PatientStatus | "All">("All");
@@ -398,6 +374,12 @@ export default function DoctorPatientsPage() {
   const [view, setView] = useState<ViewMode>("table");
   const [page, setPage] = useState(1);
 
+  // CURSOR PAGINATION HISTORY
+
+  const [cursorHistory, setCursorHistory] = useState<
+    (string | null)[]
+  >([null]);
+
   // DOCTOR AVAILABILITY STATE
 
   const [availability, setAvailability] =
@@ -407,8 +389,6 @@ export default function DoctorPatientsPage() {
     useState(false);
 
   // BACKEND INTEGRATION STATE
-
-  const [accessToken, setAccessToken] = useState<string | null>(null);
 
   const [profileLoading, setProfileLoading] = useState(true);
   const [availabilitySaving, setAvailabilitySaving] = useState(false);
@@ -436,106 +416,58 @@ export default function DoctorPatientsPage() {
   const maxPatients = workload.maxPatients;
   const remainingCapacity = workload.remainingCapacity;
 
-  // API URL
+  // CURRENT PAGE CURSOR
 
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/+$/, "");
+  const currentCursor = cursorHistory[page - 1] ?? null;
 
   // LOAD DOCTOR PROFILE FROM BACKEND
 
-  const loadDoctorProfile = useCallback(
-    async (token: string) => {
-      if (!apiUrl) {
-        setApiError("The API address is not configured.");
-        setProfileLoading(false);
-        return;
-      }
+  const loadDoctorProfile = useCallback(async () => {
+    setProfileLoading(true);
 
-      try {
-        const response = await fetch(
-          `${apiUrl}/doctors/me/profile`,
-          {
-            method: "GET",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/json",
-            },
-            cache: "no-store",
-          },
-        );
+    try {
+      const data = await apiRequest<unknown>(
+        "/doctors/me/profile",
+      );
 
-        const data: unknown = await response.json();
+      const profile = parseDoctorProfile(data);
 
-        if (!response.ok) {
-          throw new Error(
-            getApiError(
-              data,
-              "Unable to load your doctor profile.",
-            ),
-          );
-        }
-
-        const profile = parseDoctorProfile(data);
-
-        setAvailability(profile.availabilityStatus);
-        setDepartment(profile.department);
-        setWorkload(profile.workload);
-      } catch (error) {
-        setApiError(
-          error instanceof Error
-            ? error.message
-            : "Unable to load your doctor profile.",
-        );
-      } finally {
-        setProfileLoading(false);
-      }
-    },
-    [apiUrl],
-  );
+      setAvailability(profile.availabilityStatus);
+      setDepartment(profile.department);
+      setWorkload(profile.workload);
+    } catch (error) {
+      setApiError(
+        error instanceof Error
+          ? error.message
+          : "Unable to load your doctor profile.",
+      );
+    } finally {
+      setProfileLoading(false);
+    }
+  }, [apiRequest]);
 
   // LOAD ASSIGNED PATIENTS FROM BACKEND
 
   const loadAssignedPatients = useCallback(
-    async (token: string, currentPage: number, searchTerm: string) => {
-      if (!apiUrl) {
-        setApiError("The API address is not configured.");
-        setPatientsLoading(false);
-        return;
-      }
-
+    async (searchTerm: string, cursor: string | null) => {
       setPatientsLoading(true);
 
       try {
         const queryParams = new URLSearchParams({
-          page: String(currentPage),
           limit: String(PAGE_SIZE),
         });
+
+        if (cursor) {
+          queryParams.set("cursor", cursor);
+        }
 
         if (searchTerm.trim()) {
           queryParams.set("search", searchTerm.trim());
         }
 
-        const response = await fetch(
-          `${apiUrl}/doctors/me/assigned-patients?${queryParams.toString()}`,
-          {
-            method: "GET",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/json",
-            },
-            cache: "no-store",
-          },
+        const data = await apiRequest<unknown>(
+          `/doctors/me/assigned-patients?${queryParams.toString()}`,
         );
-
-        const data: unknown = await response.json();
-
-        if (!response.ok) {
-          throw new Error(
-            getApiError(
-              data,
-              "Unable to load your assigned patients.",
-            ),
-          );
-        }
 
         const result = parseAssignedPatientsResponse(data);
 
@@ -553,66 +485,84 @@ export default function DoctorPatientsPage() {
         setPatientsLoading(false);
       }
     },
-    [apiUrl],
+    [apiRequest],
   );
 
-  // GET TOKEN FROM EXISTING AUTH SESSION
+  // LOAD DOCTOR PROFILE WHEN AUTHENTICATION IS READY
 
   useEffect(() => {
-    try {
-      const storedSession =
-        window.sessionStorage.getItem(SESSION_KEY);
-
-      if (!storedSession) {
-        setApiError(
-          "Your session has expired. Please sign in again.",
-        );
-
-        setProfileLoading(false);
-        setPatientsLoading(false);
-        return;
-      }
-
-      const parsed: unknown = JSON.parse(storedSession);
-
-      if (
-        !isRecord(parsed) ||
-        typeof parsed.accessToken !== "string" ||
-        !parsed.accessToken
-      ) {
-        setApiError(
-          "Your authentication session is invalid. Please sign in again.",
-        );
-
-        setProfileLoading(false);
-        setPatientsLoading(false);
-        return;
-      }
-
-      setAccessToken(parsed.accessToken);
-
-      void loadDoctorProfile(parsed.accessToken);
-    } catch {
-      setApiError("Unable to read your authentication session.");
+    if (!accessToken) {
       setProfileLoading(false);
       setPatientsLoading(false);
+      return;
     }
-  }, [loadDoctorProfile]);
+
+    void loadDoctorProfile();
+  }, [accessToken, loadDoctorProfile]);
 
   // FETCH ASSIGNED PATIENTS WHEN TOKEN, PAGE OR SEARCH CHANGES
 
   useEffect(() => {
     if (!accessToken) return;
 
-    void loadAssignedPatients(accessToken, page, search);
-  }, [accessToken, page, search, loadAssignedPatients]);
+    void loadAssignedPatients(search, currentCursor);
+  }, [
+    accessToken,
+    page,
+    search,
+    currentCursor,
+    loadAssignedPatients,
+  ]);
+
+  // AUTOMATICALLY REFRESH DOCTOR PROFILE AND ASSIGNED PATIENTS
+
+  useEffect(() => {
+    if (!accessToken) return;
+
+    const refreshData = () => {
+      void loadDoctorProfile();
+      void loadAssignedPatients(search, currentCursor);
+    };
+
+    const interval = window.setInterval(
+      refreshData,
+      REFRESH_INTERVAL,
+    );
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [
+    accessToken,
+    search,
+    currentCursor,
+    loadDoctorProfile,
+    loadAssignedPatients,
+  ]);
+
+  // MANUALLY REFRESH DOCTOR PROFILE AND ASSIGNED PATIENTS
+
+  const handleRefresh = useCallback(() => {
+    if (!accessToken) return;
+
+    setApiError(null);
+
+    void loadDoctorProfile();
+    void loadAssignedPatients(search, currentCursor);
+  }, [
+    accessToken,
+    search,
+    currentCursor,
+    loadDoctorProfile,
+    loadAssignedPatients,
+  ]);
 
   // UPDATE DOCTOR AVAILABILITY
 
   async function handleAvailabilityChange(
     newAvailability: AvailabilityStatus,
   ) {
-    if (!accessToken || !apiUrl) {
+    if (!accessToken) {
       setApiError(
         "Your session is unavailable. Please sign in again.",
       );
@@ -630,32 +580,21 @@ export default function DoctorPatientsPage() {
     setShowAvailabilityOptions(false);
 
     try {
-      const response = await fetch(
-        `${apiUrl}/doctors/me/availability`,
+      await apiRequest<unknown>(
+        "/doctors/me/availability",
         {
           method: "PATCH",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
+          body: {
             availabilityStatus: newAvailability,
-          }),
+          },
         },
       );
 
-      const data: unknown = await response.json();
+      await loadDoctorProfile();
 
-      if (!response.ok) {
-        throw new Error(
-          getApiError(
-            data,
-            "Unable to update your availability.",
-          ),
-        );
-      }
-
-      await loadDoctorProfile(accessToken);
+      // Refresh the assigned-patient list after availability changes.
+      // The backend may automatically assign waiting patients.
+      await loadAssignedPatients(search, currentCursor);
 
       setSuccessMessage(
         "Your availability has been updated successfully.",
@@ -777,13 +716,41 @@ export default function DoctorPatientsPage() {
     sort,
   ]);
 
-  const totalPages = pagination.totalPages;
-
   const visiblePatients = filteredPatients;
+
+  // SEARCH HANDLER
 
   function handleSearch(value: string) {
     setSearch(value);
     setPage(1);
+    setCursorHistory([null]);
+  }
+
+  // NEXT PAGE
+
+  function handleNextPage() {
+    if (!pagination.hasMore || !pagination.nextCursor) {
+      return;
+    }
+
+    const nextPage = page + 1;
+
+    setCursorHistory((previous) => [
+      ...previous.slice(0, page),
+      pagination.nextCursor,
+    ]);
+
+    setPage(nextPage);
+  }
+
+  // PREVIOUS PAGE
+
+  function handlePreviousPage() {
+    if (page <= 1) {
+      return;
+    }
+
+    setPage((previous) => previous - 1);
   }
 
   return (
@@ -801,16 +768,32 @@ export default function DoctorPatientsPage() {
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() =>
-            console.log("Add new patient clicked")
-          }
-          className="inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus:outline-none focus:ring-4 focus:ring-blue-100"
-        >
-          <Plus className="h-4 w-4" />
-          Add New Patient
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={!accessToken || patientsLoading}
+            className="inline-flex items-center justify-center gap-2 rounded-xl border border-blue-100 bg-white px-4 py-3 text-sm font-semibold text-[#54709c] shadow-sm transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${
+                patientsLoading ? "animate-spin" : ""
+              }`}
+            />
+            Refresh
+          </button>
+
+          <button
+            type="button"
+            onClick={() =>
+              console.log("Add new patient clicked")
+            }
+            className="inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus:outline-none focus:ring-4 focus:ring-blue-100"
+          >
+            <Plus className="h-4 w-4" />
+            Add New Patient
+          </button>
+        </div>
       </div>
 
       {/* DOCTOR AVAILABILITY */}
@@ -1175,7 +1158,7 @@ export default function DoctorPatientsPage() {
             <p className="mt-1 text-xs text-slate-400">
               {patientsLoading
                 ? "Loading assigned patients..."
-                : `${pagination.total} assigned patients found`}
+                : `${assignedPatients.length} patients on this page`}
             </p>
           </div>
 
@@ -1246,28 +1229,18 @@ export default function DoctorPatientsPage() {
               </div>
             )}
 
-            {/* PAGINATION */}
+            {/* CURSOR PAGINATION */}
 
             <div className="flex flex-col gap-3 border-t border-blue-50 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
               <p className="text-xs text-slate-400">
-                Showing{" "}
-                {(page - 1) * PAGE_SIZE + 1}–
-                {Math.min(
-                  page * PAGE_SIZE,
-                  pagination.total,
-                )}{" "}
-                of {pagination.total}
+                Showing {assignedPatients.length} patients on this page
               </p>
 
               <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  disabled={page === 1}
-                  onClick={() =>
-                    setPage((current) =>
-                      Math.max(1, current - 1),
-                    )
-                  }
+                  disabled={page === 1 || patientsLoading}
+                  onClick={handlePreviousPage}
                   className="rounded-lg border border-blue-100 px-3 py-2 text-xs font-medium text-[#54709c] disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Previous
@@ -1279,12 +1252,8 @@ export default function DoctorPatientsPage() {
 
                 <button
                   type="button"
-                  disabled={page >= totalPages}
-                  onClick={() =>
-                    setPage((current) =>
-                      Math.min(totalPages, current + 1),
-                    )
-                  }
+                  disabled={!pagination.hasMore || patientsLoading}
+                  onClick={handleNextPage}
                   className="rounded-lg border border-blue-100 px-3 py-2 text-xs font-medium text-[#54709c] disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Next
@@ -1314,11 +1283,7 @@ export default function DoctorPatientsPage() {
               <button
                 type="button"
                 onClick={() =>
-                  void loadAssignedPatients(
-                    accessToken,
-                    page,
-                    search,
-                  )
+                  void loadAssignedPatients(search, currentCursor)
                 }
                 className="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700"
               >
@@ -1331,6 +1296,8 @@ export default function DoctorPatientsPage() {
     </main>
   );
 }
+
+
 
 
 

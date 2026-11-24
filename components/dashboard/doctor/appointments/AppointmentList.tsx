@@ -1,3 +1,4 @@
+
 "use client";
 
 import { CalendarClock } from "lucide-react";
@@ -20,8 +21,8 @@ const statusGroups = [
     bg: "bg-[#e1efff]",
   },
   {
-    status: "in_progress",
-    label: "In Consultation",
+    status: "confirmed",
+    label: "Confirmed",
     color: "text-[#7c3aed]",
     bg: "bg-[#ede9fe]",
   },
@@ -49,7 +50,7 @@ const statusGroups = [
     color: "text-[#64748b]",
     bg: "bg-[#f1f5f9]",
   },
-];
+] as const;
 
 export default function AppointmentList({
   appointments,
@@ -63,11 +64,11 @@ export default function AppointmentList({
         <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="text-lg font-semibold text-[#102f5f]">
-              Appointments Today
+              Appointments
             </h2>
 
             <p className="mt-1 text-xs text-[#7891b1]">
-              Your patient queue for Tuesday, 16 September 2025
+              Your appointments from the hospital schedule
             </p>
           </div>
 
@@ -78,7 +79,6 @@ export default function AppointmentList({
         </div>
       </div>
 
-      {/* Desktop table header */}
       <div className="hidden grid-cols-[95px_minmax(180px,1.2fr)_minmax(160px,1fr)_145px_105px] gap-4 bg-[#f8fbff] px-4 py-3 text-[11px] font-semibold uppercase tracking-wide text-[#7891b1] sm:grid lg:grid-cols-[95px_minmax(220px,1.2fr)_minmax(180px,1fr)_150px_120px]">
         <span>Time</span>
         <span>Patient</span>
@@ -93,9 +93,7 @@ export default function AppointmentList({
             (appointment) => appointment.status === group.status,
           );
 
-          if (!groupAppointments.length) {
-            return null;
-          }
+          if (!groupAppointments.length) return null;
 
           return (
             <div key={group.status}>
@@ -116,21 +114,26 @@ export default function AppointmentList({
                 </p>
               </div>
 
-              <div>
-                {groupAppointments.map((appointment) => (
-                  <AppointmentRow
-                    key={appointment.id}
-                    appointment={appointment}
-                    onOpen={onOpen}
-                    onAddNote={onAddNote}
-                    onComplete={onComplete}
-                  />
-                ))}
-              </div>
+              {groupAppointments.map((appointment) => (
+                <AppointmentRow
+                  key={appointment.id}
+                  appointment={appointment}
+                  onOpen={onOpen}
+                  onAddNote={onAddNote}
+                  onComplete={onComplete}
+                />
+              ))}
             </div>
           );
         })}
+
+        {appointments.length === 0 && (
+          <div className="px-5 py-12 text-center text-sm text-[#7891b1]">
+            No appointments found.
+          </div>
+        )}
       </div>
     </div>
   );
 }
+

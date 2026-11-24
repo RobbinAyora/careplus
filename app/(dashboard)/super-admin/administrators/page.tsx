@@ -10,8 +10,8 @@ import {
 } from "react";
 
 import { useAuth } from "@/lib/auth/session";
+import { useApiClient } from "@/lib/api/client";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
 type UserStatus = boolean;
 
@@ -54,33 +54,6 @@ const EMPTY_FORM: AdminForm = {
   phone: "",
 };
 
-async function readResponse(response: Response): Promise<unknown> {
-  const text = await response.text();
-
-  if (!text) return null;
-
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return { message: text };
-  }
-}
-
-function getErrorMessage(data: unknown): string {
-  if (data && typeof data === "object" && "message" in data) {
-    const message = data.message;
-
-    if (Array.isArray(message)) {
-      return message.join(", ");
-    }
-
-    if (typeof message === "string") {
-      return message;
-    }
-  }
-
-  return "Something went wrong. Please try again.";
-}
 
 function formatDate(date?: string) {
   if (!date) return "—";
@@ -124,6 +97,7 @@ function HospitalBadge({
 
 export default function AdministratorsPage() {
   const { accessToken, isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
   const [hospitals, setHospitals] = useState<Hospital[]>([]);
   const [loading, setLoading] = useState(true);
@@ -152,13 +126,9 @@ export default function AdministratorsPage() {
 
   // LOAD HOSPITALS AND THEIR ADMINISTRATORS
   const fetchHospitals = useCallback(async () => {
-    if (!API_URL || !accessToken) {
+    if (!accessToken) {
       setLoading(false);
-      setError(
-        !API_URL
-          ? "API URL is not configured."
-          : "Please sign in."
-      );
+      setError("Please sign in.");
       return;
     }
 
@@ -166,18 +136,7 @@ export default function AdministratorsPage() {
     setError("");
 
     try {
-      const response = await fetch(`${API_URL}/hospitals`, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-        cache: "no-store",
-      });
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
+      const data = await apiRequest<unknown>("/hospitals");
 
       if (!Array.isArray(data)) {
         throw new Error("Unexpected hospital data received.");
@@ -193,7 +152,7 @@ export default function AdministratorsPage() {
     } finally {
       setLoading(false);
     }
-  }, [accessToken]);
+  }, [accessToken, apiRequest]);
 
   useEffect(() => {
     if (isSessionLoaded) {
@@ -296,7 +255,7 @@ export default function AdministratorsPage() {
     event.preventDefault();
     setFormError("");
 
-    if (!API_URL || !accessToken) {
+    if (!accessToken) {
       setFormError("Your session or API configuration is missing.");
       return;
     }
@@ -325,28 +284,18 @@ export default function AdministratorsPage() {
     setSaving(true);
 
     try {
-      const response = await fetch(
-        `${API_URL}/hospitals/${selectedHospitalId}/admins`,
+      await apiRequest<unknown>(
+        `/hospitals/${selectedHospitalId}/admins`,
         {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify({
+          body: {
             firstName: form.firstName.trim(),
             lastName: form.lastName.trim(),
             email: form.email.trim().toLowerCase(),
             phone: form.phone.trim() || undefined,
-          }),
+          },
         }
       );
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
 
       setForm(EMPTY_FORM);
       setSelectedHospitalId("");
@@ -368,7 +317,7 @@ export default function AdministratorsPage() {
 
   // SUSPEND OR ACTIVATE ADMINISTRATOR
   async function handleAdminStatusChange() {
-    if (!API_URL || !accessToken || !adminToChange) {
+    if (!accessToken || !adminToChange) {
       setToast("Your session or API configuration is missing.");
       return;
     }
@@ -379,25 +328,15 @@ export default function AdministratorsPage() {
     setChangingStatus(true);
 
     try {
-      const response = await fetch(
-        `${API_URL}/hospitals/${admin.hospitalId}/admins/${admin.id}/status`,
+      await apiRequest<unknown>(
+        `/hospitals/${admin.hospitalId}/admins/${admin.id}/status`,
         {
           method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify({
+          body: {
             isActive: newStatus,
-          }),
+          },
         }
       );
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
 
       // Update the selected administrator immediately.
       setSelectedAdmin((current) =>

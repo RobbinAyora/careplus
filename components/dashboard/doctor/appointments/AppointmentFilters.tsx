@@ -1,21 +1,18 @@
+
 "use client";
 
 import { Search, UsersRound } from "lucide-react";
 
-type StatusFilter =
-  | "all"
-  | "checked_in"
-  | "in_progress"
-  | "scheduled"
-  | "completed"
-  | "no_show"
-  | "cancelled";
+import type { AppointmentStatus } from "./appointments-data";
+
+export type StatusFilter = "all" | AppointmentStatus;
 
 type AppointmentFiltersProps = {
   status: StatusFilter;
   onStatusChange: (status: StatusFilter) => void;
   search: string;
   onSearchChange: (value: string) => void;
+  todayCount: number;
   waitingCount: number;
 };
 
@@ -25,7 +22,7 @@ const filters: {
 }[] = [
   { value: "all", label: "All" },
   { value: "checked_in", label: "Checked-in" },
-  { value: "in_progress", label: "In consultation" },
+  { value: "confirmed", label: "Confirmed" },
   { value: "scheduled", label: "Upcoming" },
   { value: "completed", label: "Completed" },
   { value: "no_show", label: "No-show" },
@@ -37,6 +34,7 @@ export default function AppointmentFilters({
   onStatusChange,
   search,
   onSearchChange,
+  todayCount,
   waitingCount,
 }: AppointmentFiltersProps) {
   return (
@@ -52,16 +50,8 @@ export default function AppointmentFilters({
                 type="button"
                 onClick={() => onStatusChange(filter.value)}
                 className={`
-                  shrink-0
-                  rounded-full
-                  px-3.5
-                  py-2
-                  text-xs
-                  font-medium
-                  transition
-                  focus:outline-none
-                  focus:ring-2
-                  focus:ring-[#2d91e8]/40
+                  shrink-0 rounded-full px-3.5 py-2 text-xs font-medium
+                  transition focus:outline-none focus:ring-2 focus:ring-[#2d91e8]/40
                   ${
                     active
                       ? "bg-[#2d91e8] text-white"
@@ -88,31 +78,24 @@ export default function AppointmentFilters({
               onChange={(event) => onSearchChange(event.target.value)}
               placeholder="Search patient name or ID"
               className="
-                h-10
-                w-full
-                rounded-xl
-                border
-                border-[#dce8f5]
-                bg-[#fbfdff]
-                pl-9
-                pr-3
-                text-xs
-                text-[#294b76]
-                outline-none
-                placeholder:text-[#9aacc1]
-                focus:border-[#5aa7ef]
-                focus:ring-2
-                focus:ring-[#2d91e8]/10
+                h-10 w-full rounded-xl border border-[#dce8f5]
+                bg-[#fbfdff] pl-9 pr-3 text-xs text-[#294b76]
+                outline-none placeholder:text-[#9aacc1]
+                focus:border-[#5aa7ef] focus:ring-2 focus:ring-[#2d91e8]/10
               "
             />
           </div>
 
           <div className="flex h-10 shrink-0 items-center justify-center gap-2 rounded-xl bg-[#eef6ff] px-3 text-xs font-medium text-[#1677d2]">
             <UsersRound size={15} />
-            <span>8 today · {waitingCount} waiting</span>
+            <span>
+              {todayCount} today · {waitingCount} waiting
+            </span>
           </div>
         </div>
       </div>
     </div>
   );
 }
+
+

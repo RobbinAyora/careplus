@@ -1,3 +1,4 @@
+
 import type { AuthSession, Role } from "./types";
 
 interface BackendLoginResponse {
@@ -20,7 +21,7 @@ const ROLE_MAP: Record<string, Role> = {
   NURSE: "nurse",
   RECEPTIONIST: "receptionist",
   PHARMACIST: "pharmacist",
-LABORATORY: "laboratory",
+  LABORATORY: "laboratory",
   RADIOLOGY: "radiology",
   CASHIER: "cashier",
 };
@@ -38,6 +39,7 @@ export async function authenticate(
   try {
     const response = await fetch(`${apiUrl}/auth/login`, {
       method: "POST",
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
       },
@@ -57,6 +59,10 @@ export async function authenticate(
           ? data.message
           : null;
 
+      if (Array.isArray(message)) {
+        return { error: message.join(", ") };
+      }
+
       return {
         error:
           typeof message === "string"
@@ -71,10 +77,29 @@ export async function authenticate(
       !("accessToken" in data) ||
       !("user" in data)
     ) {
-      return { error: "The server returned an invalid login response." };
+      return {
+        error: "The server returned an invalid login response.",
+      };
     }
 
     const result = data as BackendLoginResponse;
+
+    if (
+      typeof result.accessToken !== "string" ||
+      !result.accessToken ||
+      !result.user ||
+      typeof result.user.id !== "string" ||
+      typeof result.user.email !== "string" ||
+      typeof result.user.firstName !== "string" ||
+      typeof result.user.lastName !== "string" ||
+      typeof result.user.role !== "string" ||
+      typeof result.user.mustChangePassword !== "boolean"
+    ) {
+      return {
+        error: "The server returned incomplete login information.",
+      };
+    }
+
     const role = ROLE_MAP[result.user.role];
 
     if (!role) {
@@ -102,3 +127,4 @@ export async function authenticate(
     };
   }
 }
+

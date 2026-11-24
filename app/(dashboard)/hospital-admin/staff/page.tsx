@@ -8,9 +8,9 @@ import {
   useState,
   type FormEvent,
 } from "react";
-import { useAuth } from "@/lib/auth/session";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL;
+import { useAuth } from "@/lib/auth/session";
+import { useApiClient } from "@/lib/api/client";
 
 const STAFF_ROLES = [
   "DOCTOR",
@@ -33,7 +33,10 @@ interface StaffMember {
   phone: string | null;
   role: StaffRole;
   isActive: boolean;
+  mustChangePassword: boolean;
   createdAt: string;
+  updatedAt?: string;
+  version: number;
 }
 
 interface StaffForm {
@@ -47,6 +50,18 @@ interface StaffForm {
 interface ToastMessage {
   id: number;
   type: ToastType;
+  message: string;
+}
+
+interface StaffPageResponse {
+  data: StaffMember[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+interface EnrollResponse {
+  staff: StaffMember;
+  invitationSent: boolean;
   message: string;
 }
 
@@ -70,42 +85,49 @@ function formatDate(date: string) {
   }).format(new Date(date));
 }
 
-function getErrorMessage(data: unknown): string {
-  if (data && typeof data === "object" && "message" in data) {
-    const message = data.message;
-
-    if (Array.isArray(message)) {
-      return message
-        .filter((item): item is string => typeof item === "string")
-        .join(", ");
-    }
-
-    if (typeof message === "string") {
-      return message;
-    }
+function parseStaffPage(response: unknown): StaffPageResponse {
+  // Backward compatibility if the server still returns an array.
+  if (Array.isArray(response)) {
+    return {
+      data: response as StaffMember[],
+      nextCursor: null,
+      hasMore: false,
+    };
   }
 
-  return "Something went wrong. Please try again.";
-}
-
-async function readResponse(response: Response): Promise<unknown> {
-  const text = await response.text();
-
-  if (!text) return null;
-
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return { message: text };
+  if (
+    typeof response !== "object" ||
+    response === null ||
+    !("data" in response) ||
+    !Array.isArray(response.data)
+  ) {
+    throw new Error("The server returned an unexpected staff list.");
   }
+
+  const result = response as {
+    data: StaffMember[];
+    nextCursor?: string | null;
+    hasMore?: boolean;
+  };
+
+  return {
+    data: result.data,
+    nextCursor: result.nextCursor ?? null,
+    hasMore: result.hasMore ?? false,
+  };
 }
 
 export default function StaffPage() {
   const { accessToken, isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
   const [staff, setStaff] = useState<StaffMember[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
+
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
 
   const [search, setSearch] = useState("");
   const [roleFilter, setRoleFilter] = useState("ALL");
@@ -139,15 +161,13 @@ export default function StaffPage() {
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
-  // Fetch staff members.
+  // Fetch the first page of staff members.
   const fetchStaff = useCallback(async () => {
-    if (!accessToken || !API_URL) {
+    if (!isSessionLoaded) return false;
+
+    if (!accessToken) {
       setLoading(false);
-      setError(
-        !API_URL
-          ? "API URL is not configured."
-          : "Please sign in to view staff."
-      );
+      setError("Please sign in to view staff.");
       return false;
     }
 
@@ -155,24 +175,13 @@ export default function StaffPage() {
     setError("");
 
     try {
-      const response = await fetch(`${API_URL}/staff`, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-        cache: "no-store",
-      });
+      const response = await apiRequest<unknown>("/staff?limit=100");
+      const page = parseStaffPage(response);
 
-      const data = await readResponse(response);
+      setStaff(page.data);
+      setNextCursor(page.nextCursor);
+      setHasMore(page.hasMore);
 
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
-
-      if (!Array.isArray(data)) {
-        throw new Error("The server returned an unexpected staff list.");
-      }
-
-      setStaff(data as StaffMember[]);
       return true;
     } catch (err) {
       const message =
@@ -183,7 +192,48 @@ export default function StaffPage() {
     } finally {
       setLoading(false);
     }
-  }, [accessToken]);
+  }, [accessToken, apiRequest, isSessionLoaded]);
+
+  // Fetch additional staff records using the cursor.
+  const loadMoreStaff = useCallback(async () => {
+    if (!nextCursor || loadingMore || !hasMore) return;
+
+    setLoadingMore(true);
+
+    try {
+      const params = new URLSearchParams({
+        limit: "100",
+        cursor: nextCursor,
+      });
+
+      const response = await apiRequest<unknown>(
+        `/staff?${params.toString()}`,
+      );
+
+      const page = parseStaffPage(response);
+
+      setStaff((current) => {
+        const existingIds = new Set(current.map((member) => member.id));
+
+        return [
+          ...current,
+          ...page.data.filter((member) => !existingIds.has(member.id)),
+        ];
+      });
+
+      setNextCursor(page.nextCursor);
+      setHasMore(page.hasMore);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Unable to load more staff.";
+
+      showToast("error", message);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [apiRequest, hasMore, loadingMore, nextCursor, showToast]);
 
   useEffect(() => {
     if (isSessionLoaded) {
@@ -191,7 +241,7 @@ export default function StaffPage() {
     }
   }, [isSessionLoaded, fetchStaff]);
 
-  // Search and filter staff.
+  // Search and filter the loaded staff records.
   const filteredStaff = useMemo(() => {
     const query = search.trim().toLowerCase();
 
@@ -202,7 +252,8 @@ export default function StaffPage() {
       const matchesSearch =
         !query ||
         fullName.includes(query) ||
-        member.email.toLowerCase().includes(query);
+        member.email.toLowerCase().includes(query) ||
+        (member.phone ?? "").toLowerCase().includes(query);
 
       const matchesRole =
         roleFilter === "ALL" || member.role === roleFilter;
@@ -218,7 +269,7 @@ export default function StaffPage() {
 
   function updateField<K extends keyof StaffForm>(
     field: K,
-    value: StaffForm[K]
+    value: StaffForm[K],
   ) {
     setForm((current) => ({
       ...current,
@@ -231,41 +282,31 @@ export default function StaffPage() {
     event.preventDefault();
     setFormError("");
 
-    if (!accessToken || !API_URL) {
-      setFormError("Your session or API configuration is missing.");
+    if (!isSessionLoaded || !accessToken) {
+      setFormError("Your session is still loading or has expired.");
       return;
     }
 
     setSaving(true);
 
     try {
-      const response = await fetch(`${API_URL}/staff`, {
+      const result = await apiRequest<EnrollResponse>("/staff", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: JSON.stringify({
+        body: {
           firstName: form.firstName.trim(),
           lastName: form.lastName.trim(),
           email: form.email.trim(),
           phone: form.phone.trim() || undefined,
           role: form.role,
-        }),
+        },
       });
-
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
 
       setForm(EMPTY_FORM);
       setModalOpen(false);
 
       showToast(
-        "success",
-        "Staff member enrolled and invitation email sent successfully."
+        result.invitationSent ? "success" : "error",
+        result.message,
       );
 
       await fetchStaff();
@@ -284,19 +325,18 @@ export default function StaffPage() {
 
   // Suspend or reactivate a staff account.
   async function handleStatusChange(member: StaffMember) {
-    if (!accessToken || !API_URL) {
-      showToast("error", "Your session or API configuration is missing.");
+    if (!isSessionLoaded || !accessToken) {
+      showToast("error", "Your session is still loading or has expired.");
       return;
     }
 
     const nextStatus = !member.isActive;
-
     const action = nextStatus ? "reactivate" : "suspend";
 
     const confirmed = window.confirm(
       nextStatus
         ? `Are you sure you want to reactivate ${member.firstName} ${member.lastName}'s account?`
-        : `Are you sure you want to suspend ${member.firstName} ${member.lastName}'s account? They will no longer be able to access the system.`
+        : `Are you sure you want to suspend ${member.firstName} ${member.lastName}'s account? They will no longer be able to access the system.`,
     );
 
     if (!confirmed) return;
@@ -304,44 +344,30 @@ export default function StaffPage() {
     setActionLoading(member.id);
 
     try {
-      const response = await fetch(
-        `${API_URL}/staff/${member.id}/status`,
+      const updated = await apiRequest<StaffMember>(
+        `/staff/${member.id}/status`,
         {
           method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify({
+          body: {
             isActive: nextStatus,
-          }),
-        }
+          },
+        },
       );
 
-      const data = await readResponse(response);
-
-      if (!response.ok) {
-        throw new Error(getErrorMessage(data));
-      }
-
-      // Update the row immediately.
       setStaff((current) =>
         current.map((item) =>
           item.id === member.id
-            ? { ...item, isActive: nextStatus }
-            : item
-        )
+            ? { ...item, ...updated }
+            : item,
+        ),
       );
 
       showToast(
         "success",
         nextStatus
           ? `${member.firstName} ${member.lastName} has been reactivated.`
-          : `${member.firstName} ${member.lastName} has been suspended.`
+          : `${member.firstName} ${member.lastName} has been suspended.`,
       );
-
-      // Refresh from the server to ensure the list is current.
-      await fetchStaff();
     } catch (err) {
       const message =
         err instanceof Error
@@ -354,9 +380,49 @@ export default function StaffPage() {
     }
   }
 
+  // Resend the initial staff invitation.
+  async function handleResendInvitation(member: StaffMember) {
+    if (!isSessionLoaded || !accessToken) {
+      showToast("error", "Your session is still loading or has expired.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Resend the initial login invitation to ${member.email}?`,
+    );
+
+    if (!confirmed) return;
+
+    setActionLoading(`${member.id}-resend`);
+
+    try {
+      const result = await apiRequest<{
+        invitationSent: boolean;
+        message: string;
+      }>(`/staff/${member.id}/resend-invitation`, {
+        method: "POST",
+      });
+
+      showToast(
+        result.invitationSent ? "success" : "error",
+        result.message,
+      );
+
+      await fetchStaff();
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Unable to resend the invitation.";
+
+      showToast("error", message);
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
   return (
     <div className="mx-auto max-w-[1500px] px-5 py-6 sm:px-7 xl:px-8">
-
       {/* Toast notification */}
       {toast && (
         <div
@@ -424,7 +490,7 @@ export default function StaffPage() {
             </h2>
             <p className="mt-1 text-xs text-slate-500">
               {filteredStaff.length} staff member
-              {filteredStaff.length === 1 ? "" : "s"} found
+              {filteredStaff.length === 1 ? "" : "s"} shown
             </p>
           </div>
 
@@ -476,7 +542,7 @@ export default function StaffPage() {
         )}
 
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[1050px] text-left text-sm">
+          <table className="w-full min-w-[1150px] text-left text-sm">
             <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
               <tr>
                 <th className="px-5 py-4 font-semibold">Staff member</th>
@@ -491,13 +557,19 @@ export default function StaffPage() {
             <tbody className="divide-y divide-slate-100">
               {loading ? (
                 <tr>
-                  <td colSpan={6} className="px-5 py-12 text-center text-slate-500">
+                  <td
+                    colSpan={6}
+                    className="px-5 py-12 text-center text-slate-500"
+                  >
                     Loading staff...
                   </td>
                 </tr>
               ) : filteredStaff.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-5 py-12 text-center text-slate-500">
+                  <td
+                    colSpan={6}
+                    className="px-5 py-12 text-center text-slate-500"
+                  >
                     No staff members found.
                   </td>
                 </tr>
@@ -541,22 +613,41 @@ export default function StaffPage() {
                     </td>
 
                     <td className="px-5 py-4">
-                      <button
-                        type="button"
-                        disabled={actionLoading === member.id}
-                        onClick={() => void handleStatusChange(member)}
-                        className={`rounded-lg px-3 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                          member.isActive
-                            ? "bg-red-50 text-red-700 hover:bg-red-100"
-                            : "bg-green-50 text-green-700 hover:bg-green-100"
-                        }`}
-                      >
-                        {actionLoading === member.id
-                          ? "Please wait..."
-                          : member.isActive
-                            ? "Suspend"
-                            : "Reactivate"}
-                      </button>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={actionLoading === member.id}
+                          onClick={() => void handleStatusChange(member)}
+                          className={`rounded-lg px-3 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                            member.isActive
+                              ? "bg-red-50 text-red-700 hover:bg-red-100"
+                              : "bg-green-50 text-green-700 hover:bg-green-100"
+                          }`}
+                        >
+                          {actionLoading === member.id
+                            ? "Please wait..."
+                            : member.isActive
+                              ? "Suspend"
+                              : "Reactivate"}
+                        </button>
+
+                        {member.isActive && member.mustChangePassword && (
+                          <button
+                            type="button"
+                            disabled={
+                              actionLoading === `${member.id}-resend`
+                            }
+                            onClick={() =>
+                              void handleResendInvitation(member)
+                            }
+                            className="rounded-lg bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700 transition hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {actionLoading === `${member.id}-resend`
+                              ? "Sending..."
+                              : "Resend invitation"}
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))
@@ -564,6 +655,19 @@ export default function StaffPage() {
             </tbody>
           </table>
         </div>
+
+        {!loading && hasMore && (
+          <div className="flex justify-center border-t border-slate-100 p-4">
+            <button
+              type="button"
+              disabled={loadingMore}
+              onClick={() => void loadMoreStaff()}
+              className="rounded-lg border border-slate-200 px-5 py-2.5 text-sm font-semibold text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {loadingMore ? "Loading..." : "Load more staff"}
+            </button>
+          </div>
+        )}
       </section>
 
       {/* Enrollment modal */}
@@ -614,6 +718,7 @@ export default function StaffPage() {
                   </label>
                   <input
                     required
+                    maxLength={50}
                     value={form.firstName}
                     onChange={(event) =>
                       updateField("firstName", event.target.value)
@@ -629,6 +734,7 @@ export default function StaffPage() {
                   </label>
                   <input
                     required
+                    maxLength={50}
                     value={form.lastName}
                     onChange={(event) =>
                       updateField("lastName", event.target.value)
@@ -646,6 +752,7 @@ export default function StaffPage() {
                 <input
                   required
                   type="email"
+                  maxLength={254}
                   value={form.email}
                   onChange={(event) =>
                     updateField("email", event.target.value)
@@ -661,6 +768,7 @@ export default function StaffPage() {
                 </label>
                 <input
                   type="tel"
+                  maxLength={20}
                   value={form.phone}
                   onChange={(event) =>
                     updateField("phone", event.target.value)
@@ -720,4 +828,6 @@ export default function StaffPage() {
     </div>
   );
 }
+
+
 

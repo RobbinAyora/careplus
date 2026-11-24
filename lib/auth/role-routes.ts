@@ -1,6 +1,7 @@
-import type { Role } from "./mock-users";
 
-export const DASHBOARD_PATHS: Record<Role, string> = {
+import type { Role } from "./types";
+
+export const DASHBOARD_PATHS: Partial<Record<Role, string>> = {
   super_admin: "/super-admin/dashboard",
   hospital_admin: "/hospital-admin/dashboard",
   doctor: "/doctor/dashboard",
@@ -10,7 +11,7 @@ export const DASHBOARD_PATHS: Record<Role, string> = {
   laboratory: "/laboratory/dashboard",
 };
 
-export const ROLE_LABELS: Record<Role, string> = {
+export const ROLE_LABELS: Partial<Record<Role, string>> = {
   super_admin: "Super Admin",
   hospital_admin: "Admin",
   doctor: "Doctor",
@@ -19,3 +20,4 @@ export const ROLE_LABELS: Record<Role, string> = {
   pharmacist: "Pharmacist",
   laboratory: "Laboratory",
 };
+

@@ -20,17 +20,24 @@ import {
 } from "lucide-react";
 
 import { useAuth } from "@/lib/auth/session";
+import { useApiClient } from "@/lib/api/client";
 
 type Department = {
   id: string;
   name: string;
   description: string | null;
   isActive: boolean;
-  hospitalId: string;
+  version: number;
   _count?: {
     doctors: number;
     visits?: number;
   };
+};
+
+type DepartmentsResponse = {
+  data: Department[];
+  nextCursor: string | null;
+  hasMore: boolean;
 };
 
 type DepartmentForm = {
@@ -40,51 +47,14 @@ type DepartmentForm = {
 
 type StatusFilter = "ALL" | "ACTIVE" | "INACTIVE";
 
-const API_URL = (
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:5001"
-).replace(/\/$/, "");
-
 const emptyForm: DepartmentForm = {
   name: "",
   description: "",
 };
 
-async function departmentRequest<T>(
-  token: string,
-  endpoint: string,
-  options: RequestInit = {},
-): Promise<T> {
-  if (!token) {
-    throw new Error("Your session has expired. Please log in again.");
-  }
-
-  const response = await fetch(`${API_URL}${endpoint}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-      ...options.headers,
-    },
-  });
-
-  const responseData = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    const message =
-      responseData?.message ||
-      responseData?.error ||
-      `Request failed (${response.status})`;
-
-    throw new Error(
-      Array.isArray(message) ? message.join(", ") : message,
-    );
-  }
-
-  return responseData as T;
-}
-
 export default function DepartmentsPage() {
   const { accessToken, isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
   const [departments, setDepartments] = useState<Department[]>([]);
   const [loading, setLoading] = useState(true);
@@ -115,12 +85,54 @@ export default function DepartmentsPage() {
     try {
       setError("");
 
-      const data = await departmentRequest<Department[]>(
-        accessToken,
-        "/departments?includeInactive=true",
-      );
+      const allDepartments: Department[] = [];
 
-      setDepartments(Array.isArray(data) ? data : []);
+      let cursor: string | null = null;
+      let hasMore = true;
+
+      const visitedCursors = new Set<string>();
+
+      while (hasMore) {
+        const params = new URLSearchParams({
+          includeInactive: "true",
+          limit: "100",
+        });
+
+        if (cursor) {
+          params.set("cursor", cursor);
+        }
+
+        const response = await apiRequest<DepartmentsResponse>(
+          `/departments?${params.toString()}`,
+        );
+
+        if (
+          !response ||
+          !Array.isArray(response.data) ||
+          typeof response.hasMore !== "boolean"
+        ) {
+          throw new Error(
+            "The departments response from the server is invalid.",
+          );
+        }
+
+        allDepartments.push(...response.data);
+
+        hasMore = response.hasMore;
+        cursor = response.nextCursor;
+
+        if (hasMore) {
+          if (!cursor || visitedCursors.has(cursor)) {
+            throw new Error(
+              "Unable to continue loading departments. Invalid pagination cursor.",
+            );
+          }
+
+          visitedCursors.add(cursor);
+        }
+      }
+
+      setDepartments(allDepartments);
     } catch (err) {
       setError(
         err instanceof Error
@@ -130,11 +142,13 @@ export default function DepartmentsPage() {
     } finally {
       setLoading(false);
     }
-  }, [accessToken, isSessionLoaded]);
+  }, [accessToken, apiRequest, isSessionLoaded]);
 
   useEffect(() => {
-    void loadDepartments();
-  }, [loadDepartments]);
+    if (isSessionLoaded) {
+      void loadDepartments();
+    }
+  }, [isSessionLoaded, loadDepartments]);
 
   useEffect(() => {
     if (!success) return;
@@ -207,8 +221,8 @@ export default function DepartmentsPage() {
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!accessToken) {
-      setError("Your session has expired. Please log in again.");
+    if (!isSessionLoaded || !accessToken) {
+      setError("Your session is still loading or has expired.");
       return;
     }
 
@@ -225,29 +239,28 @@ export default function DepartmentsPage() {
       setError("");
 
       if (editingDepartment) {
-        await departmentRequest<Department>(
-          accessToken,
+        await apiRequest<unknown>(
           `/departments/${editingDepartment.id}`,
           {
             method: "PATCH",
-            body: JSON.stringify({
+            body: {
               name,
               description,
-            }),
+              expectedVersion: editingDepartment.version,
+            },
           },
         );
 
         setSuccess("Department updated successfully.");
       } else {
-        await departmentRequest<Department>(
-          accessToken,
+        await apiRequest<unknown>(
           "/departments",
           {
             method: "POST",
-            body: JSON.stringify({
+            body: {
               name,
               description,
-            }),
+            },
           },
         );
 
@@ -271,8 +284,8 @@ export default function DepartmentsPage() {
   }
 
   async function toggleDepartment(department: Department) {
-    if (!accessToken) {
-      setError("Your session has expired. Please log in again.");
+    if (!isSessionLoaded || !accessToken) {
+      setError("Your session is still loading or has expired.");
       return;
     }
 
@@ -290,8 +303,7 @@ export default function DepartmentsPage() {
       setActionId(department.id);
       setError("");
 
-      await departmentRequest<Department>(
-        accessToken,
+      await apiRequest<unknown>(
         `/departments/${department.id}/${action}`,
         {
           method: "PATCH",
@@ -798,4 +810,5 @@ function StatCard({
     </div>
   );
 }
+
 

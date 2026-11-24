@@ -1,7 +1,7 @@
 
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   Search,
   UserPlus,
@@ -17,6 +17,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { useAuth } from "@/lib/auth/session";
+import { useApiClient } from "@/lib/api/client";
 
 type ToastType = "success" | "error" | "warning";
 
@@ -112,21 +113,6 @@ function normalizeKenyanPhone(phone: string): string {
   }
 
   return cleaned;
-}
-
-function getErrorMessage(data: unknown): string {
-  if (
-    typeof data === "object" &&
-    data !== null &&
-    "message" in data
-  ) {
-    const message = data.message;
-
-    if (typeof message === "string") return message;
-    if (Array.isArray(message)) return message.join(", ");
-  }
-
-  return "Something went wrong. Please try again.";
 }
 
 function extractPatients(data: unknown): PatientRecord[] {
@@ -226,7 +212,8 @@ function getVisitStatusClass(status?: string): string {
 }
 
 export default function PatientRegistrationPage() {
-  const { accessToken } = useAuth();
+  const { isSessionLoaded } = useAuth();
+  const apiRequest = useApiClient();
 
   const [mode, setMode] = useState<"search" | "new" | "existing">(
     "search",
@@ -257,15 +244,19 @@ export default function PatientRegistrationPage() {
   const [recentLoading, setRecentLoading] = useState(false);
 
   const [recentPage, setRecentPage] = useState(1);
-  const [totalPatients, setTotalPatients] = useState(0);
-  const [totalPages, setTotalPages] = useState(0);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+
+  // Stores the cursor used to load each page.
+  // Page 1 always uses null.
+  const [cursorHistory, setCursorHistory] = useState<(string | null)[]>([
+    null,
+  ]);
 
   // Tracks which patient's visit is currently being checked.
   const [checkingVisitId, setCheckingVisitId] = useState<string | null>(
     null,
   );
-
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "");
 
   function showToast(type: ToastType, message: string) {
     setToast({ type, message });
@@ -277,156 +268,99 @@ export default function PatientRegistrationPage() {
     }, 4500);
   }
 
-  async function apiRequest(
-    path: string,
-    method: "GET" | "POST",
-    body?: unknown,
-  ): Promise<unknown> {
-    if (!apiUrl) {
-      console.error("[CarePlus API] API URL is not configured.");
-      throw new Error("The backend API URL is not configured.");
-    }
-
-    if (!accessToken) {
-      console.error("[CarePlus API] Missing access token.");
-      throw new Error("Your session has expired. Please log in again.");
-    }
-
-    const url = `${apiUrl}${path}`;
-
-    console.group(`[CarePlus API] ${method} ${path}`);
-    console.log("Request URL:", url);
-    console.log("Request method:", method);
-
-    if (body) {
-      console.log("Request payload:", body);
-    }
-
-    try {
-      const response = await fetch(url, {
-        method,
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          ...(body ? { "Content-Type": "application/json" } : {}),
-        },
-        ...(body ? { body: JSON.stringify(body) } : {}),
-      });
-
-      console.log("Response status:", response.status);
-      console.log("Response status text:", response.statusText);
-
-      const data: unknown = await response.json().catch((parseError) => {
-        console.error(
-          "[CarePlus API] Could not parse response JSON:",
-          parseError,
-        );
-        return null;
-      });
-
-      console.log("Response body:", data);
-
-      if (!response.ok) {
-        console.error(
-          "[CarePlus API] Request failed:",
-          response.status,
-          data,
-        );
-
-        throw new Error(getErrorMessage(data));
-      }
-
-      console.log("[CarePlus API] Request successful.");
-
-      return data;
-    } catch (error) {
-      console.error("[CarePlus API] Request error:", error);
-      throw error;
-    } finally {
-      console.groupEnd();
-    }
-  }
-
   // -----------------------------------
   // LOAD REGISTERED PATIENTS
   // -----------------------------------
 
-  async function loadRecentPatients(page: number = 1) {
-    setRecentLoading(true);
+  const loadRecentPatients = useCallback(
+    async (cursor: string | null = null, page: number = 1) => {
+      if (!isSessionLoaded) return;
 
-    try {
-      const data = await apiRequest(
-        `/patients?page=${page}&limit=${PATIENTS_PER_PAGE}`,
-        "GET",
-      );
+      setRecentLoading(true);
 
-      if (typeof data !== "object" || data === null) {
-        throw new Error("Invalid patient list response from server.");
+      try {
+        const cursorQuery = cursor
+          ? `&cursor=${encodeURIComponent(cursor)}`
+          : "";
+
+        const data = await apiRequest<unknown>(
+          `/patients?limit=${PATIENTS_PER_PAGE}${cursorQuery}`,
+        );
+
+        if (typeof data !== "object" || data === null) {
+          throw new Error("Invalid patient list response from server.");
+        }
+
+        const result = data as Record<string, unknown>;
+
+        const records = extractPatients(result);
+
+        const returnedNextCursor =
+          typeof result.nextCursor === "string"
+            ? result.nextCursor
+            : null;
+
+        const returnedHasMore = result.hasMore === true;
+
+        setRecentPatients(records);
+        setNextCursor(returnedNextCursor);
+        setHasMore(returnedHasMore);
+        setRecentPage(page);
+
+        console.log("[Patient Pagination] Loaded patients:", records);
+        console.log("[Patient Pagination] Current page:", page);
+        console.log("[Patient Pagination] Has more:", returnedHasMore);
+      } catch (error) {
+        console.error(
+          "[Patient Pagination] Failed to load patients:",
+          error,
+        );
+
+        showToast(
+          "error",
+          error instanceof Error
+            ? error.message
+            : "Unable to load registered patients.",
+        );
+      } finally {
+        setRecentLoading(false);
       }
-
-      const result = data as Record<string, unknown>;
-
-      const records = extractPatients(result);
-
-      const total = Number(result.total ?? 0);
-      const currentPage = Number(result.page ?? page);
-      const pages = Number(result.totalPages ?? 0);
-
-      setRecentPatients(records);
-      setTotalPatients(total);
-      setTotalPages(pages);
-      setRecentPage(currentPage);
-
-      console.log("[Patient Pagination] Loaded patients:", records);
-      console.log("[Patient Pagination] Total patients:", total);
-      console.log("[Patient Pagination] Current page:", currentPage);
-      console.log("[Patient Pagination] Total pages:", pages);
-    } catch (error) {
-      console.error("[Patient Pagination] Failed to load patients:", error);
-
-      showToast(
-        "error",
-        error instanceof Error
-          ? error.message
-          : "Unable to load registered patients.",
-      );
-    } finally {
-      setRecentLoading(false);
-    }
-  }
+    },
+    [apiRequest, isSessionLoaded],
+  );
 
   // Load the first page when the authenticated page opens.
   useEffect(() => {
-    if (accessToken) {
-      void loadRecentPatients(1);
-    }
-  }, [accessToken]);
+    if (!isSessionLoaded) return;
 
-  // Navigate to a specific page.
-  function changeRecentPage(page: number) {
-    if (
-      page < 1 ||
-      page > totalPages ||
-      page === recentPage ||
-      recentLoading
-    ) {
+    void loadRecentPatients(null, 1);
+  }, [isSessionLoaded, loadRecentPatients]);
+
+  // Navigate to the next cursor page.
+  function changeToNextRecentPage() {
+    if (!nextCursor || !hasMore || recentLoading) {
       return;
     }
 
-    void loadRecentPatients(page);
+    const cursor = nextCursor;
+
+    setCursorHistory((current) => [
+      ...current.slice(0, recentPage),
+      cursor,
+    ]);
+
+    void loadRecentPatients(cursor, recentPage + 1);
   }
 
-  // Generate numbered pagination buttons.
-  function getPageNumbers() {
-    const pages: number[] = [];
-
-    const start = Math.max(1, recentPage - 2);
-    const end = Math.min(totalPages, recentPage + 2);
-
-    for (let page = start; page <= end; page++) {
-      pages.push(page);
+  // Navigate to the previous cursor page.
+  function changeToPreviousRecentPage() {
+    if (recentPage <= 1 || recentLoading) {
+      return;
     }
 
-    return pages;
+    const previousCursor = cursorHistory[recentPage - 2] ?? null;
+
+    void loadRecentPatients(previousCursor, recentPage - 1);
   }
 
   function updateField(
@@ -451,9 +385,8 @@ export default function PatientRegistrationPage() {
 
       // GET /patients/:id returns the patient and their visits.
       // This request does not create a visit.
-      const data = await apiRequest(
+      const data = await apiRequest<unknown>(
         `/patients/${patientId}`,
-        "GET",
       );
 
       if (typeof data !== "object" || data === null) {
@@ -535,9 +468,8 @@ export default function PatientRegistrationPage() {
     console.log("[Patient Search] Searching for:", query);
 
     try {
-      const data = await apiRequest(
+      const data = await apiRequest<unknown>(
         `/patients/search?q=${encodeURIComponent(query)}`,
-        "GET",
       );
 
       const results = extractPatients(data);
@@ -594,10 +526,12 @@ export default function PatientRegistrationPage() {
       return false;
     }
 
-    await apiRequest(
+    await apiRequest<unknown>(
       `/patients/${patientId}/visits`,
-      "POST",
-      payload,
+      {
+        method: "POST",
+        body: payload,
+      },
     );
 
     return true;
@@ -721,10 +655,12 @@ export default function PatientRegistrationPage() {
     );
 
     try {
-      const data = await apiRequest(
+      const data = await apiRequest<unknown>(
         "/patients",
-        "POST",
-        patientPayload,
+        {
+          method: "POST",
+          body: patientPayload,
+        },
       );
 
       console.log("[Patient Registration] Create patient response:", data);
@@ -768,7 +704,8 @@ export default function PatientRegistrationPage() {
         );
 
         // Refresh AFTER visit creation so the latest visit is included.
-        await loadRecentPatients(1);
+        setCursorHistory([null]);
+        await loadRecentPatients(null, 1);
 
         showToast(
           "success",
@@ -787,7 +724,8 @@ export default function PatientRegistrationPage() {
         );
 
         // Still show the registered patient even if visit creation fails.
-        await loadRecentPatients(1);
+        setCursorHistory([null]);
+        await loadRecentPatients(null, 1);
 
         showToast(
           "warning",
@@ -840,8 +778,9 @@ export default function PatientRegistrationPage() {
         "[Patient Visit] Visit successfully registered for existing patient.",
       );
 
-      // Refresh the list after the visit has been created.
-      await loadRecentPatients(recentPage);
+      // Refresh the current cursor page after the visit is created.
+      const currentCursor = cursorHistory[recentPage - 1] ?? null;
+      await loadRecentPatients(currentCursor, recentPage);
 
       showToast(
         "success",
@@ -1134,12 +1073,17 @@ export default function PatientRegistrationPage() {
 
               <div className="flex items-center gap-2">
                 <span className="rounded-lg bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-700">
-                  {totalPatients.toLocaleString()} patients
+                  {recentPatients.length} shown
                 </span>
 
                 <button
                   type="button"
-                  onClick={() => loadRecentPatients(recentPage)}
+                  onClick={() =>
+                    loadRecentPatients(
+                      cursorHistory[recentPage - 1] ?? null,
+                      recentPage,
+                    )
+                  }
                   disabled={recentLoading}
                   title="Refresh patient list"
                   aria-label="Refresh patient list"
@@ -1323,20 +1267,13 @@ export default function PatientRegistrationPage() {
                 <div className="flex flex-col gap-4 border-t border-[#edf2f8] px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
 
                   <p className="text-sm text-slate-500">
-                    Showing{" "}
+                    Page{" "}
                     <span className="font-semibold text-[#294568]">
-                      {(recentPage - 1) * PATIENTS_PER_PAGE + 1}
+                      {recentPage}
                     </span>
-                    {" - "}
+                    {" · Showing "}
                     <span className="font-semibold text-[#294568]">
-                      {Math.min(
-                        recentPage * PATIENTS_PER_PAGE,
-                        totalPatients,
-                      )}
-                    </span>
-                    {" of "}
-                    <span className="font-semibold text-[#294568]">
-                      {totalPatients.toLocaleString()}
+                      {recentPatients.length}
                     </span>
                     {" patients"}
                   </p>
@@ -1346,7 +1283,7 @@ export default function PatientRegistrationPage() {
                     {/* Previous */}
                     <button
                       type="button"
-                      onClick={() => changeRecentPage(recentPage - 1)}
+                      onClick={changeToPreviousRecentPage}
                       disabled={recentPage === 1 || recentLoading}
                       className="flex items-center gap-1 rounded-lg border border-[#dce6f1] px-3 py-2 text-sm font-medium text-[#294568] transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
                     >
@@ -1354,72 +1291,12 @@ export default function PatientRegistrationPage() {
                       <span>Previous</span>
                     </button>
 
-                    {/* First page */}
-                    {recentPage > 3 && (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => changeRecentPage(1)}
-                          disabled={recentLoading}
-                          className="h-9 min-w-9 rounded-lg border border-[#dce6f1] px-3 text-sm font-medium text-[#294568] hover:bg-blue-50 disabled:opacity-40"
-                        >
-                          1
-                        </button>
-
-                        {recentPage > 4 && (
-                          <span className="px-1 text-slate-400">
-                            ...
-                          </span>
-                        )}
-                      </>
-                    )}
-
-                    {/* Page numbers */}
-                    {getPageNumbers().map((page) => (
-                      <button
-                        key={page}
-                        type="button"
-                        onClick={() => changeRecentPage(page)}
-                        disabled={recentLoading}
-                        aria-current={
-                          page === recentPage ? "page" : undefined
-                        }
-                        className={`h-9 min-w-9 rounded-lg px-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                          page === recentPage
-                            ? "bg-[#2563eb] text-white shadow-sm"
-                            : "border border-[#dce6f1] text-[#294568] hover:bg-blue-50"
-                        }`}
-                      >
-                        {page}
-                      </button>
-                    ))}
-
-                    {/* Last page */}
-                    {recentPage < totalPages - 2 && (
-                      <>
-                        {recentPage < totalPages - 3 && (
-                          <span className="px-1 text-slate-400">
-                            ...
-                          </span>
-                        )}
-
-                        <button
-                          type="button"
-                          onClick={() => changeRecentPage(totalPages)}
-                          disabled={recentLoading}
-                          className="h-9 min-w-9 rounded-lg border border-[#dce6f1] px-3 text-sm font-medium text-[#294568] hover:bg-blue-50 disabled:opacity-40"
-                        >
-                          {totalPages}
-                        </button>
-                      </>
-                    )}
-
                     {/* Next */}
                     <button
                       type="button"
-                      onClick={() => changeRecentPage(recentPage + 1)}
+                      onClick={changeToNextRecentPage}
                       disabled={
-                        recentPage >= totalPages || recentLoading
+                        !hasMore || !nextCursor || recentLoading
                       }
                       className="flex items-center gap-1 rounded-lg border border-[#dce6f1] px-3 py-2 text-sm font-medium text-[#294568] transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
                     >
@@ -1828,6 +1705,8 @@ function VisitFields({
     </div>
   );
 }
+ 
+
 
 
 
