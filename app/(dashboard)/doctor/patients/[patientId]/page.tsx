@@ -1,1310 +1,2193 @@
 
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import { useParams, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth/session";
 import { useApiClient } from "@/lib/api/client";
 
 import {
-  ChevronDown,
-  Grid2X2,
-  List,
-  Plus,
-  Search,
-  SlidersHorizontal,
-  Clock,
-  Users,
-  UserCheck,
   Activity,
-  Stethoscope,
+  AlertCircle,
+  ArrowLeft,
+  CalendarDays,
   CheckCircle2,
+  Clock3,
+  FileText,
+  HeartPulse,
+  Loader2,
+  MapPin,
+  Phone,
+  Pill,
+  Plus,
   RefreshCw,
+  Save,
+  ShieldAlert,
+  Stethoscope,
+  Trash2,
+  UserRound,
+  ClipboardList,
 } from "lucide-react";
 
-import PatientTable from "@/components/dashboard/doctor/patients/PatientTable";
-import PatientCard from "@/components/dashboard/doctor/patients/PatientCard";
+// ======================================================
+// TYPES - MATCHING THE BACKEND RESPONSE
+// ======================================================
 
-import type {
-  Gender,
-  Patient,
-  PatientStatus,
-} from "@/lib/patients/patient-types";
+type VisitStatus =
+  | "AWAITING_TRIAGE"
+  | "TRIAGED"
+  | "WITH_DOCTOR"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "DISCHARGED"
+  | string;
 
-type ViewMode = "table" | "grid";
-type SortMode = "recent" | "alphabetical" | "flagged";
+type DiagnosisType = "PRIMARY" | "SECONDARY";
 
-type AvailabilityStatus =
-  | "AVAILABLE"
-  | "ON_BREAK"
-  | "OFF_DUTY";
-
-interface DoctorWorkload {
-  waitingPatients: number;
-  patientsInConsultation: number;
-  currentWorkload: number;
-  maxPatients: number;
-  remainingCapacity: number;
+interface Patient {
+  id: string;
+  patientNumber?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  otherNames?: string | null;
+  dateOfBirth?: string | null;
+  estimatedAgeYears?: number | null;
+  sex?: string | null;
+  phone?: string | null;
+  alternativePhone?: string | null;
+  email?: string | null;
+  residence?: string | null;
+  paymentType?: string | null;
 }
 
-interface DoctorProfileData {
-  availabilityStatus: AvailabilityStatus;
-  department: string | null;
-  workload: DoctorWorkload;
+interface TriageRecord {
+  id: string;
+  chiefComplaint?: string | null;
+  temperature?: number | null;
+  pulseRate?: number | null;
+  systolicBP?: number | null;
+  diastolicBP?: number | null;
+  respiratoryRate?: number | null;
+  oxygenSaturation?: number | null;
+  weight?: number | null;
+  height?: number | null;
+  allergies?: string[] | null;
+  currentMedications?: string[] | null;
+  priority?: string | null;
+  additionalNotes?: string | null;
+  recordedAt?: string | null;
 }
 
-interface AssignedPatientsPagination {
-  limit: number;
-  nextCursor: string | null;
-  hasMore: boolean;
+interface Department {
+  id: string;
+  name: string;
 }
 
-const PAGE_SIZE = 20;
-const REFRESH_INTERVAL = 30000;
-
-const DEFAULT_WORKLOAD: DoctorWorkload = {
-  waitingPatients: 0,
-  patientsInConsultation: 0,
-  currentWorkload: 0,
-  maxPatients: 0,
-  remainingCapacity: 0,
-};
-
-const DEFAULT_PAGINATION: AssignedPatientsPagination = {
-  limit: PAGE_SIZE,
-  nextCursor: null,
-  hasMore: false,
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+interface Diagnosis {
+  id: string;
+  code?: string | null;
+  description: string;
+  diagnosisType?: DiagnosisType | null;
+  notes?: string | null;
+  createdAt?: string;
 }
 
-function getNumber(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value
-    : fallback;
+interface PrescriptionItem {
+  id: string;
+  medicationName: string;
+  strength?: string | null;
+  dosage: string;
+  route?: string | null;
+  frequency: string;
+  duration?: string | null;
+  quantity?: number | null;
+  instructions?: string | null;
+  refills?: number | null;
 }
 
-function getString(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
+interface Prescription {
+  id: string;
+  notes?: string | null;
+  status?: string;
+  prescribedAt?: string;
+  items: PrescriptionItem[];
 }
 
-function getAvailabilityStatus(
-  value: unknown,
-): AvailabilityStatus | null {
-  if (
-    value === "AVAILABLE" ||
-    value === "ON_BREAK" ||
-    value === "OFF_DUTY"
-  ) {
-    return value;
-  }
-
-  return null;
+interface Consultation {
+  id: string;
+  examinationFindings?: string | null;
+  diagnosis?: string | null;
+  diagnosisNotes?: string | null;
+  treatmentPlan?: string | null;
+  followUpInstructions?: string | null;
+  completedAt?: string | null;
+  doctor?: {
+    id: string;
+    firstName: string;
+    lastName: string;
+    email?: string | null;
+  } | null;
+  diagnoses?: Diagnosis[];
+  prescriptions?: Prescription[];
 }
 
-function parseDoctorProfile(data: unknown): DoctorProfileData {
-  if (!isRecord(data)) {
-    throw new Error("The server returned an invalid doctor profile.");
-  }
+interface Visit {
+  id: string;
+  visitNumber?: string | null;
+  visitType?: string | null;
+  status: VisitStatus;
+  reasonForVisit?: string | null;
+  isEmergency?: boolean;
+  createdAt?: string;
+  completedAt?: string | null;
+  patient: Patient;
+  departmentRef?: Department | null;
+  triageRecord?: TriageRecord | null;
+  consultation?: Consultation | null;
+}
 
-  const profile = isRecord(data.doctorProfile)
-    ? data.doctorProfile
-    : isRecord(data.profile)
-      ? data.profile
-      : data;
+interface QueueEntry {
+  id: string;
+  status: VisitStatus;
+  queueNumber?: number | null;
+  department?: string | null;
+  checkedInAt?: string | null;
+  triagedAt?: string | null;
+  consultationAt?: string | null;
+  visit?: {
+    id: string;
+    patient?: {
+      id: string;
+    };
+  } | null;
+}
 
-  const workload = isRecord(data.workload)
-    ? data.workload
-    : profile;
-
-  const departmentRef = isRecord(profile.departmentRef)
-    ? profile.departmentRef
-    : null;
-
-  const availabilityStatus = getAvailabilityStatus(
-    profile.availabilityStatus ?? data.availabilityStatus,
-  );
-
-  if (!availabilityStatus) {
-    throw new Error(
-      "The doctor availability status was missing or invalid in the server response.",
-    );
-  }
-
-  const waitingPatients = getNumber(workload.waitingPatients);
-
-  const patientsInConsultation = getNumber(
-    workload.patientsInConsultation,
-  );
-
-  const currentWorkload = getNumber(
-    workload.currentWorkload,
-    waitingPatients + patientsInConsultation,
-  );
-
-  const maxPatients = getNumber(
-    workload.maxPatients,
-    getNumber(profile.maxPatients),
-  );
-
-  const remainingCapacity = getNumber(
-    workload.remainingCapacity,
-    Math.max(0, maxPatients - currentWorkload),
-  );
-
-  return {
-    availabilityStatus,
-    department:
-      typeof departmentRef?.name === "string"
-        ? departmentRef.name
-        : typeof profile.department === "string"
-          ? profile.department
-          : null,
-    workload: {
-      waitingPatients,
-      patientsInConsultation,
-      currentWorkload,
-      maxPatients,
-      remainingCapacity,
-    },
+interface AssignedPatientsResponse {
+  message: string;
+  data: QueueEntry[];
+  pagination?: {
+    nextCursor: string | null;
+    hasMore: boolean;
+    limit: number;
   };
 }
 
-/**
- * Calculates a patient's age from their date of birth.
- */
-function calculateAge(dateOfBirth: unknown): number {
-  if (typeof dateOfBirth !== "string") return 0;
-
-  const date = new Date(dateOfBirth);
-
-  if (Number.isNaN(date.getTime())) return 0;
-
-  const today = new Date();
-
-  let age = today.getFullYear() - date.getFullYear();
-
-  const monthDifference = today.getMonth() - date.getMonth();
-
-  if (
-    monthDifference < 0 ||
-    (monthDifference === 0 && today.getDate() < date.getDate())
-  ) {
-    age--;
-  }
-
-  return Math.max(0, age);
+interface VisitApiResponse {
+  message: string;
+  data: Visit;
 }
 
-/**
- * Converts the backend's sex/gender values into the values
- * expected by the existing Patient components.
- */
-function parseGender(value: unknown): Gender {
-  const normalized = String(value ?? "").toUpperCase();
-
-  if (normalized === "MALE") return "Male";
-  if (normalized === "FEMALE") return "Female";
-
-  return "Male";
+interface ConsultationForm {
+  examinationFindings: string;
+  diagnosis: string;
+  diagnosisNotes: string;
+  treatmentPlan: string;
+  followUpInstructions: string;
 }
 
-/**
- * Converts the backend visit information into the existing
- * frontend Patient structure.
- */
-function mapAssignedPatient(queueEntry: unknown): Patient {
-  if (!isRecord(queueEntry)) {
-    throw new Error("The server returned an invalid patient record.");
-  }
+interface DiagnosisForm {
+  code: string;
+  description: string;
+  diagnosisType: DiagnosisType;
+  notes: string;
+}
 
-  const visit = isRecord(queueEntry.visit)
-    ? queueEntry.visit
-    : queueEntry;
+interface PrescriptionFormItem {
+  medicationName: string;
+  strength: string;
+  dosage: string;
+  route: string;
+  frequency: string;
+  duration: string;
+  quantity: string;
+  instructions: string;
+  refills: string;
+}
 
-  const patient = isRecord(visit.patient)
-    ? visit.patient
-    : isRecord(queueEntry.patient)
-      ? queueEntry.patient
-      : {};
+const EMPTY_CONSULTATION: ConsultationForm = {
+  examinationFindings: "",
+  diagnosis: "",
+  diagnosisNotes: "",
+  treatmentPlan: "",
+  followUpInstructions: "",
+};
 
-  const triageRecord = isRecord(visit.triageRecord)
-    ? visit.triageRecord
-    : isRecord(queueEntry.triageRecord)
-      ? queueEntry.triageRecord
-      : {};
+const EMPTY_DIAGNOSIS: DiagnosisForm = {
+  code: "",
+  description: "",
+  diagnosisType: "SECONDARY",
+  notes: "",
+};
 
-  const assignedDoctor = isRecord(queueEntry.assignedDoctor)
-    ? queueEntry.assignedDoctor
-    : {};
+const EMPTY_PRESCRIPTION_ITEM: PrescriptionFormItem = {
+  medicationName: "",
+  strength: "",
+  dosage: "",
+  route: "",
+  frequency: "",
+  duration: "",
+  quantity: "",
+  instructions: "",
+  refills: "0",
+};
 
-  const firstName = getString(patient.firstName);
-  const lastName = getString(patient.lastName);
-  const otherNames = getString(patient.otherNames);
+// ======================================================
+// HELPERS
+// ======================================================
 
-  const fullName = [firstName, otherNames, lastName]
+function getPatientName(patient?: Patient | null): string {
+  if (!patient) return "Unknown patient";
+
+  return [
+    patient.firstName,
+    patient.otherNames,
+    patient.lastName,
+  ]
     .filter(Boolean)
     .join(" ");
-
-  const dateOfBirth = patient.dateOfBirth;
-
-  const visitType = getString(visit.visitType).toUpperCase();
-
-  const visitStatus = getString(
-    queueEntry.status ?? visit.status,
-  ).toUpperCase();
-
-  const patientStatus: PatientStatus =
-    visitType === "INPATIENT" ? "Admitted" : "Outpatient";
-
-  const priority = getString(triageRecord.priority).toUpperCase();
-
-  const allergies = Array.isArray(triageRecord.allergies)
-    ? triageRecord.allergies.filter(
-        (item): item is string => typeof item === "string",
-      )
-    : [];
-
-  const medications = Array.isArray(
-    triageRecord.currentMedications,
-  )
-    ? triageRecord.currentMedications.filter(
-        (item): item is string => typeof item === "string",
-      )
-    : [];
-
-  const patientId = getString(patient.id);
-
-  return {
-    id: patientId,
-    name: fullName || "Unnamed Patient",
-    age: calculateAge(dateOfBirth),
-    gender: parseGender(patient.sex ?? patient.gender),
-    phone: getString(patient.phone),
-    email: getString(patient.email),
-    avatar: getString(patient.avatar),
-    status: patientStatus,
-    doctor: [
-      getString(assignedDoctor.firstName),
-      getString(assignedDoctor.lastName),
-    ]
-      .filter(Boolean)
-      .join(" ") || "Assigned Doctor",
-    ward: getString(visit.ward),
-    bed: getString(visit.bed),
-    lastVisit: getString(
-      visit.createdAt ?? queueEntry.checkedInAt,
-    ),
-    nextAppointment: "",
-    insurance: getString(patient.insuranceType),
-    allergies,
-    chronicConditions: [],
-    flagged:
-      priority === "EMERGENCY" ||
-      priority === "URGENT" ||
-      visitStatus === "REFERRED",
-    assignedDoctorId: getString(queueEntry.assignedDoctorId),
-  } as Patient;
 }
 
-/**
- * Extracts patient records and cursor pagination from the backend response.
- *
- * Expected backend response:
- * {
- *   message: string,
- *   data: [],
- *   pagination: {
- *     nextCursor: string | null,
- *     hasMore: boolean,
- *     limit: number
- *   }
- * }
- */
-function parseAssignedPatientsResponse(data: unknown): {
-  patients: Patient[];
-  pagination: AssignedPatientsPagination;
-} {
-  if (!isRecord(data)) {
-    throw new Error("The server returned an invalid patients response.");
+function formatDate(value?: string | null): string {
+  if (!value) return "Not recorded";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "Not recorded";
   }
 
-  let records: unknown[] = [];
+  return date.toLocaleDateString("en-KE", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
+}
 
-  if (Array.isArray(data.data)) {
-    records = data.data;
-  } else if (Array.isArray(data.items)) {
-    records = data.items;
-  } else if (Array.isArray(data.results)) {
-    records = data.results;
-  } else if (Array.isArray(data.queueEntries)) {
-    records = data.queueEntries;
+function formatDateTime(value?: string | null): string {
+  if (!value) return "Not recorded";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "Not recorded";
   }
 
-  const paginationSource = isRecord(data.pagination)
-    ? data.pagination
-    : isRecord(data.meta)
-      ? data.meta
-      : {};
+  return date.toLocaleString("en-KE", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 
-  const nextCursor =
-    typeof paginationSource.nextCursor === "string"
-      ? paginationSource.nextCursor
-      : null;
+function formatStatus(status?: string): string {
+  if (!status) return "Unknown";
 
-  const hasMore = paginationSource.hasMore === true;
+  return status
+    .toLowerCase()
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
 
-  const limit = getNumber(
-    paginationSource.limit,
-    PAGE_SIZE,
+function getPriorityClass(priority?: string | null): string {
+  const value = priority?.toUpperCase();
+
+  if (
+    value === "EMERGENCY" ||
+    value === "CRITICAL"
+  ) {
+    return "bg-red-50 text-red-700 ring-red-200";
+  }
+
+  if (
+    value === "URGENT" ||
+    value === "HIGH"
+  ) {
+    return "bg-orange-50 text-orange-700 ring-orange-200";
+  }
+
+  if (value === "LOW") {
+    return "bg-blue-50 text-blue-700 ring-blue-200";
+  }
+
+  return "bg-emerald-50 text-emerald-700 ring-emerald-200";
+}
+
+function getStatusClass(status?: string): string {
+  switch (status) {
+    case "TRIAGED":
+      return "bg-blue-50 text-blue-700";
+
+    case "WITH_DOCTOR":
+      return "bg-emerald-50 text-emerald-700";
+
+    case "COMPLETED":
+      return "bg-slate-100 text-slate-700";
+
+    case "CANCELLED":
+      return "bg-red-50 text-red-700";
+
+    default:
+      return "bg-amber-50 text-amber-700";
+  }
+}
+
+function displayList(
+  values?: string[] | null,
+): string {
+  if (!values || values.length === 0) {
+    return "None recorded";
+  }
+
+  return values.join(", ");
+}
+
+function unwrapVisitResponse(
+  response: Visit | VisitApiResponse,
+): Visit {
+  if ("data" in response && response.data) {
+    return response.data;
+  }
+
+  return response;
+}
+
+// ======================================================
+// REUSABLE UI COMPONENTS
+// ======================================================
+
+function SectionCard({
+  title,
+  description,
+  icon: Icon,
+  children,
+  action,
+}: {
+  title: string;
+  description?: string;
+  icon: React.ElementType;
+  children: React.ReactNode;
+  action?: React.ReactNode;
+}) {
+  return (
+    <section className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+      <div className="flex items-center justify-between gap-4 border-b border-slate-100 px-5 py-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-700">
+            <Icon size={19} />
+          </div>
+
+          <div className="min-w-0">
+            <h2 className="font-semibold text-slate-900">
+              {title}
+            </h2>
+
+            {description && (
+              <p className="mt-0.5 text-xs text-slate-500">
+                {description}
+              </p>
+            )}
+          </div>
+        </div>
+
+        {action}
+      </div>
+
+      <div className="p-5">
+        {children}
+      </div>
+    </section>
   );
-
-  return {
-    patients: records.map(mapAssignedPatient),
-    pagination: {
-      nextCursor,
-      hasMore,
-      limit,
-    },
-  };
 }
 
-export default function DoctorPatientsPage() {
-  const { accessToken } = useAuth();
+function DetailItem({
+  label,
+  value,
+}: {
+  label: string;
+  value?: string | number | null;
+}) {
+  return (
+    <div className="min-w-0">
+      <p className="text-xs font-medium uppercase tracking-wide text-slate-400">
+        {label}
+      </p>
+
+      <p className="mt-1 break-words text-sm font-medium text-slate-800">
+        {value !== undefined &&
+        value !== null &&
+        value !== ""
+          ? value
+          : "Not recorded"}
+      </p>
+    </div>
+  );
+}
+
+function VitalCard({
+  label,
+  value,
+  unit,
+  icon: Icon,
+}: {
+  label: string;
+  value?: number | string | null;
+  unit?: string;
+  icon: React.ElementType;
+}) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+      <div className="flex items-center gap-2 text-slate-500">
+        <Icon size={15} />
+
+        <span className="text-xs font-medium">
+          {label}
+        </span>
+      </div>
+
+      <p className="mt-2 text-xl font-semibold text-slate-900">
+        {value !== undefined && value !== null
+          ? `${value}${unit ?? ""}`
+          : "—"}
+      </p>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  placeholder,
+  disabled,
+  rows = 3,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  disabled?: boolean;
+  rows?: number;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-2 block text-sm font-medium text-slate-700">
+        {label}
+      </span>
+
+      <textarea
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        disabled={disabled}
+        rows={rows}
+        className="w-full resize-y rounded-xl border border-slate-200 bg-white px-3.5 py-3 text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 focus:ring-blue-50 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-500"
+      />
+    </label>
+  );
+}
+
+function InputField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  type = "text",
+  disabled,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  type?: string;
+  disabled?: boolean;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-2 block text-sm font-medium text-slate-700">
+        {label}
+      </span>
+
+      <input
+        type={type}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        disabled={disabled}
+        className="w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 focus:ring-blue-50 disabled:cursor-not-allowed disabled:bg-slate-50"
+      />
+    </label>
+  );
+}
+
+// ======================================================
+// MAIN PAGE
+// ======================================================
+
+export default function DoctorPatientConsultationPage() {
+  const params = useParams<{ patientId: string }>();
+  const router = useRouter();
+
+  const patientId = params.patientId;
+
+  const { accessToken, isSessionLoaded } = useAuth();
+
+  const [visit, setVisit] = useState<Visit | null>(null);
+
+  const [loading, setLoading] = useState(true);
+  const [starting, setStarting] = useState(false);
+  const [savingConsultation, setSavingConsultation] = useState(false);
+  const [savingDiagnosis, setSavingDiagnosis] = useState(false);
+  const [savingPrescription, setSavingPrescription] = useState(false);
+  const [completing, setCompleting] = useState(false);
+
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  const [consultationForm, setConsultationForm] =
+    useState<ConsultationForm>(EMPTY_CONSULTATION);
+
+  const [diagnosisForm, setDiagnosisForm] =
+    useState<DiagnosisForm>(EMPTY_DIAGNOSIS);
+
+  const [prescriptionNotes, setPrescriptionNotes] =
+    useState("");
+
+  const [prescriptionItems, setPrescriptionItems] =
+    useState<PrescriptionFormItem[]>([
+      { ...EMPTY_PRESCRIPTION_ITEM },
+    ]);
+
+  // ------------------------------------------------------
+  // API REQUEST HELPER
+  // ------------------------------------------------------
+
   const apiRequest = useApiClient();
 
-  const [search, setSearch] = useState("");
+  // ------------------------------------------------------
+  // LOAD FULL VISIT DETAILS
+  // ------------------------------------------------------
 
-  const [status, setStatus] = useState<PatientStatus | "All">("All");
-  const [gender, setGender] = useState<Gender | "All">("All");
-  const [ageRange, setAgeRange] = useState("All");
+  const loadVisit = useCallback(
+    async (visitId: string) => {
+      const response = await apiRequest<
+        Visit | VisitApiResponse
+      >(`/doctors/me/visits/${visitId}`);
 
-  const [sort, setSort] = useState<SortMode>("recent");
-  const [view, setView] = useState<ViewMode>("table");
-  const [page, setPage] = useState(1);
+      const data = unwrapVisitResponse(response);
 
-  // Cursor history allows the Previous button to return
-  // to the cursor used to load the previous page.
-  const [cursorHistory, setCursorHistory] = useState<
-    Record<number, string>
-  >({});
+      setVisit(data);
 
-  const currentCursor = cursorHistory[page];
+      setConsultationForm({
+        examinationFindings:
+          data.consultation?.examinationFindings ?? "",
+        diagnosis:
+          data.consultation?.diagnosis ?? "",
+        diagnosisNotes:
+          data.consultation?.diagnosisNotes ?? "",
+        treatmentPlan:
+          data.consultation?.treatmentPlan ?? "",
+        followUpInstructions:
+          data.consultation?.followUpInstructions ?? "",
+      });
 
-  // DOCTOR AVAILABILITY STATE
-
-  const [availability, setAvailability] =
-    useState<AvailabilityStatus>("OFF_DUTY");
-
-  const [showAvailabilityOptions, setShowAvailabilityOptions] =
-    useState(false);
-
-  // BACKEND INTEGRATION STATE
-
-  const [profileLoading, setProfileLoading] = useState(true);
-  const [availabilitySaving, setAvailabilitySaving] = useState(false);
-
-  const [patientsLoading, setPatientsLoading] = useState(true);
-
-  const [apiError, setApiError] = useState<string | null>(null);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
-
-  const [department, setDepartment] = useState<string | null>(null);
-
-  const [workload, setWorkload] =
-    useState<DoctorWorkload>(DEFAULT_WORKLOAD);
-
-  // BACKEND PATIENT DATA
-
-  const [assignedPatients, setAssignedPatients] = useState<Patient[]>([]);
-
-  const [pagination, setPagination] =
-    useState<AssignedPatientsPagination>(DEFAULT_PAGINATION);
-
-  const waitingPatients = workload.waitingPatients;
-  const patientsInConsultation = workload.patientsInConsultation;
-  const currentWorkload = workload.currentWorkload;
-  const maxPatients = workload.maxPatients;
-  const remainingCapacity = workload.remainingCapacity;
-
-  // LOAD DOCTOR PROFILE FROM BACKEND
-
-  const loadDoctorProfile = useCallback(async () => {
-    setProfileLoading(true);
-
-    try {
-      const data = await apiRequest<unknown>(
-        "/doctors/me/profile",
-      );
-
-      const profile = parseDoctorProfile(data);
-
-      setAvailability(profile.availabilityStatus);
-      setDepartment(profile.department);
-      setWorkload(profile.workload);
-    } catch (error) {
-      setApiError(
-        error instanceof Error
-          ? error.message
-          : "Unable to load your doctor profile.",
-      );
-    } finally {
-      setProfileLoading(false);
-    }
-  }, [apiRequest]);
-
-  // LOAD ASSIGNED PATIENTS FROM BACKEND USING CURSOR PAGINATION
-
-  const loadAssignedPatients = useCallback(
-    async (
-      currentPage: number,
-      searchTerm: string,
-      cursor?: string,
-    ) => {
-      setPatientsLoading(true);
-
-      try {
-        const queryParams = new URLSearchParams({
-          limit: String(PAGE_SIZE),
-        });
-
-        if (searchTerm.trim()) {
-          queryParams.set("search", searchTerm.trim());
-        }
-
-        if (cursor) {
-          queryParams.set("cursor", cursor);
-        }
-
-        const data = await apiRequest<unknown>(
-          `/doctors/me/assigned-patients?${queryParams.toString()}`,
-        );
-
-        const result = parseAssignedPatientsResponse(data);
-
-        setAssignedPatients(result.patients);
-        setPagination(result.pagination);
-        setApiError(null);
-      } catch (error) {
-        setAssignedPatients([]);
-
-        setApiError(
-          error instanceof Error
-            ? error.message
-            : "Unable to load your assigned patients.",
-        );
-      } finally {
-        setPatientsLoading(false);
-      }
+      return data;
     },
     [apiRequest],
   );
 
-  // LOAD DOCTOR PROFILE WHEN AUTHENTICATION IS READY
+  // ------------------------------------------------------
+  // LOAD ASSIGNED PATIENT AND THEIR VISIT
+  // ------------------------------------------------------
 
-  useEffect(() => {
-    if (!accessToken) {
-      setProfileLoading(false);
-      setPatientsLoading(false);
-      return;
-    }
+  const loadPatient = useCallback(async () => {
+    if (!patientId) return;
 
-    void loadDoctorProfile();
-  }, [accessToken, loadDoctorProfile]);
-
-  // FETCH ASSIGNED PATIENTS WHEN TOKEN, PAGE, SEARCH OR CURSOR CHANGES
-
-  useEffect(() => {
-    if (!accessToken) return;
-
-    void loadAssignedPatients(page, search, currentCursor);
-  }, [
-    accessToken,
-    page,
-    search,
-    currentCursor,
-    loadAssignedPatients,
-  ]);
-
-  // AUTOMATICALLY REFRESH DOCTOR PROFILE AND ASSIGNED PATIENTS
-
-  useEffect(() => {
-    if (!accessToken) return;
-
-    const refreshData = () => {
-      void loadDoctorProfile();
-      void loadAssignedPatients(page, search, currentCursor);
-    };
-
-    const interval = window.setInterval(
-      refreshData,
-      REFRESH_INTERVAL,
-    );
-
-    return () => {
-      window.clearInterval(interval);
-    };
-  }, [
-    accessToken,
-    page,
-    search,
-    currentCursor,
-    loadDoctorProfile,
-    loadAssignedPatients,
-  ]);
-
-  // MANUALLY REFRESH DOCTOR PROFILE AND ASSIGNED PATIENTS
-
-  const handleRefresh = useCallback(() => {
-    if (!accessToken) return;
-
-    setApiError(null);
-
-    void loadDoctorProfile();
-    void loadAssignedPatients(page, search, currentCursor);
-  }, [
-    accessToken,
-    page,
-    search,
-    currentCursor,
-    loadDoctorProfile,
-    loadAssignedPatients,
-  ]);
-
-  // UPDATE DOCTOR AVAILABILITY
-
-  async function handleAvailabilityChange(
-    newAvailability: AvailabilityStatus,
-  ) {
-    if (!accessToken) {
-      setApiError(
-        "Your session is unavailable. Please sign in again.",
-      );
-      return;
-    }
-
-    if (newAvailability === availability) {
-      setShowAvailabilityOptions(false);
-      return;
-    }
-
-    setAvailabilitySaving(true);
-    setApiError(null);
-    setSuccessMessage(null);
-    setShowAvailabilityOptions(false);
+    setLoading(true);
+    setError("");
+    setSuccess("");
 
     try {
-      await apiRequest<unknown>(
-        "/doctors/me/availability",
+      let cursor: string | null = null;
+      let assignedEntry: QueueEntry | undefined;
+
+      // Follow the backend's cursor-based pagination.
+      do {
+        const query = new URLSearchParams({
+          limit: "100",
+        });
+
+        if (cursor) {
+          query.set("cursor", cursor);
+        }
+
+        const response =
+          await apiRequest<AssignedPatientsResponse>(
+            `/doctors/me/assigned-patients?${query.toString()}`,
+          );
+
+        assignedEntry = response.data?.find(
+          (entry) =>
+            entry.visit?.patient?.id === patientId,
+        );
+
+        if (assignedEntry) {
+          break;
+        }
+
+        cursor = response.pagination?.nextCursor ?? null;
+
+        if (!response.pagination?.hasMore) {
+          break;
+        }
+      } while (cursor);
+
+      if (!assignedEntry?.visit?.id) {
+        throw new Error(
+          "This patient does not have an active visit assigned to you. They may have been reassigned, completed, or may not yet have been assigned.",
+        );
+      }
+
+      // The consultation endpoints require the VISIT ID,
+      // not the patient ID or queue entry ID.
+      await loadVisit(assignedEntry.visit.id);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to load patient details.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, [apiRequest, loadVisit, patientId]);
+
+  useEffect(() => {
+    if (!isSessionLoaded || !accessToken) return;
+
+    void loadPatient();
+  }, [isSessionLoaded, accessToken, loadPatient]);
+
+  // ------------------------------------------------------
+  // DERIVED STATE
+  // ------------------------------------------------------
+
+  const patient = visit?.patient ?? null;
+  const triage = visit?.triageRecord ?? null;
+  const consultation = visit?.consultation ?? null;
+
+  const isTriaged = visit?.status === "TRIAGED";
+
+  const isWithDoctor =
+    visit?.status === "WITH_DOCTOR";
+
+  const isCompleted =
+    visit?.status === "COMPLETED" ||
+    Boolean(consultation?.completedAt);
+
+  const canStart =
+    isTriaged || isWithDoctor;
+
+  const canEdit =
+    isWithDoctor && !isCompleted;
+
+  const patientInitials = useMemo(() => {
+    if (!patient) return "PT";
+
+    return `${patient.firstName?.[0] ?? ""}${
+      patient.lastName?.[0] ?? ""
+    }`.toUpperCase() || "PT";
+  }, [patient]);
+
+  // ------------------------------------------------------
+  // UPDATE CONSULTATION FORM
+  // ------------------------------------------------------
+
+  const updateConsultationField = (
+    field: keyof ConsultationForm,
+    value: string,
+  ) => {
+    setConsultationForm((current) => ({
+      ...current,
+      [field]: value,
+    }));
+  };
+
+  // ------------------------------------------------------
+  // START CONSULTATION
+  // POST /doctors/me/visits/:visitId/start
+  // ------------------------------------------------------
+
+  const handleStartConsultation = async () => {
+    if (!visit || !isTriaged) return;
+
+    setStarting(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      await apiRequest(
+        `/doctors/me/visits/${visit.id}/start`,
         {
-          method: "PATCH",
+          method: "POST",
+        },
+      );
+
+      await loadVisit(visit.id);
+
+      setSuccess("Consultation started successfully.");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to start consultation.",
+      );
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  // ------------------------------------------------------
+  // SAVE CONSULTATION
+  // POST if no consultation exists, PATCH if it does
+  // ------------------------------------------------------
+
+  const handleSaveConsultation = async () => {
+    if (!visit || !canEdit) return;
+
+    setSavingConsultation(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      const method = consultation ? "PATCH" : "POST";
+
+      await apiRequest(
+        `/doctors/me/visits/${visit.id}/consultation`,
+        {
+          method,
+          body: consultationForm,
+        },
+      );
+
+      await loadVisit(visit.id);
+
+      setSuccess("Consultation findings saved successfully.");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to save consultation findings.",
+      );
+    } finally {
+      setSavingConsultation(false);
+    }
+  };
+
+  // ------------------------------------------------------
+  // ADD DIAGNOSIS
+  // POST /doctors/me/visits/:visitId/diagnoses
+  // ------------------------------------------------------
+
+  const handleAddDiagnosis = async (
+    event: React.FormEvent<HTMLFormElement>,
+  ) => {
+    event.preventDefault();
+
+    if (!visit || !canEdit) return;
+
+    if (!diagnosisForm.description.trim()) {
+      setError("Enter a diagnosis description.");
+      return;
+    }
+
+    setSavingDiagnosis(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      await apiRequest(
+        `/doctors/me/visits/${visit.id}/diagnoses`,
+        {
+          method: "POST",
           body: {
-            availabilityStatus: newAvailability,
+            ...(diagnosisForm.code.trim()
+              ? { code: diagnosisForm.code.trim() }
+              : {}),
+            description: diagnosisForm.description.trim(),
+            diagnosisType: diagnosisForm.diagnosisType,
+            ...(diagnosisForm.notes.trim()
+              ? { notes: diagnosisForm.notes.trim() }
+              : {}),
           },
         },
       );
 
-      await loadDoctorProfile();
+      setDiagnosisForm({ ...EMPTY_DIAGNOSIS });
 
-      // Refresh the assigned-patient list after availability changes.
-      // The backend may automatically assign waiting patients.
-      await loadAssignedPatients(page, search, currentCursor);
+      await loadVisit(visit.id);
 
-      setSuccessMessage(
-        "Your availability has been updated successfully.",
-      );
-    } catch (error) {
-      setApiError(
-        error instanceof Error
-          ? error.message
-          : "Unable to update your availability.",
+      setSuccess("Diagnosis added successfully.");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to add diagnosis.",
       );
     } finally {
-      setAvailabilitySaving(false);
+      setSavingDiagnosis(false);
     }
-  }
+  };
 
-  // AVAILABILITY OPTIONS
+  // ------------------------------------------------------
+  // PRESCRIPTION ITEM HANDLERS
+  // ------------------------------------------------------
 
-  const availabilityOptions: {
-    value: AvailabilityStatus;
-    label: string;
-    description: string;
-    color: string;
-    dotColor: string;
-  }[] = [
-    {
-      value: "AVAILABLE",
-      label: "Available",
-      description: "You can receive new patients",
-      color: "text-emerald-700 bg-emerald-50 border-emerald-200",
-      dotColor: "bg-emerald-500",
-    },
-    {
-      value: "ON_BREAK",
-      label: "On Break",
-      description: "Temporarily unavailable",
-      color: "text-amber-700 bg-amber-50 border-amber-200",
-      dotColor: "bg-amber-500",
-    },
-    {
-      value: "OFF_DUTY",
-      label: "Off Duty",
-      description: "Not receiving new patients",
-      color: "text-slate-600 bg-slate-100 border-slate-200",
-      dotColor: "bg-slate-400",
-    },
-  ];
+  const updatePrescriptionItem = (
+    index: number,
+    field: keyof PrescriptionFormItem,
+    value: string,
+  ) => {
+    setPrescriptionItems((current) =>
+      current.map((item, itemIndex) =>
+        itemIndex === index
+          ? { ...item, [field]: value }
+          : item,
+      ),
+    );
+  };
 
-  const currentAvailability = availabilityOptions.find(
-    (option) => option.value === availability,
-  )!;
-
-  // FILTER AND SORT BACKEND PATIENTS
-
-  const filteredPatients = useMemo(() => {
-    let result = [...assignedPatients];
-
-    if (status !== "All") {
-      result = result.filter(
-        (patient) => patient.status === status,
-      );
-    }
-
-    if (gender !== "All") {
-      result = result.filter(
-        (patient) => patient.gender === gender,
-      );
-    }
-
-    if (ageRange !== "All") {
-      result = result.filter((patient) => {
-        if (ageRange === "0-17") return patient.age <= 17;
-
-        if (ageRange === "18-35") {
-          return patient.age >= 18 && patient.age <= 35;
-        }
-
-        if (ageRange === "36-55") {
-          return patient.age >= 36 && patient.age <= 55;
-        }
-
-        if (ageRange === "56+") return patient.age >= 56;
-
-        return true;
-      });
-    }
-
-    if (sort === "alphabetical") {
-      result.sort((a, b) => a.name.localeCompare(b.name));
-    }
-
-    if (sort === "flagged") {
-      result.sort(
-        (a, b) =>
-          Number(Boolean(b.flagged)) -
-          Number(Boolean(a.flagged)),
-      );
-    }
-
-    if (sort === "recent") {
-      result.sort((a, b) => {
-        const aDate = a.lastVisit
-          ? new Date(a.lastVisit).getTime()
-          : 0;
-
-        const bDate = b.lastVisit
-          ? new Date(b.lastVisit).getTime()
-          : 0;
-
-        return bDate - aDate;
-      });
-    }
-
-    return result;
-  }, [
-    assignedPatients,
-    status,
-    gender,
-    ageRange,
-    sort,
-  ]);
-
-  const visiblePatients = filteredPatients;
-
-  function handleSearch(value: string) {
-    setSearch(value);
-    setPage(1);
-    setCursorHistory({});
-  }
-
-  function handleNextPage() {
-    if (!pagination.hasMore || !pagination.nextCursor) return;
-
-    const nextPage = page + 1;
-
-    setCursorHistory((current) => ({
+  const addPrescriptionItem = () => {
+    setPrescriptionItems((current) => [
       ...current,
-      [nextPage]: pagination.nextCursor!,
-    }));
+      { ...EMPTY_PRESCRIPTION_ITEM },
+    ]);
+  };
 
-    setPage(nextPage);
-  }
+  const removePrescriptionItem = (index: number) => {
+    setPrescriptionItems((current) =>
+      current.length > 1
+        ? current.filter(
+            (_, itemIndex) => itemIndex !== index,
+          )
+        : current,
+    );
+  };
 
-  function handlePreviousPage() {
-    if (page <= 1) return;
+  // ------------------------------------------------------
+  // ISSUE PRESCRIPTION
+  // POST /doctors/me/visits/:visitId/prescriptions
+  // ------------------------------------------------------
 
-    setPage((current) => Math.max(1, current - 1));
-  }
+  const handleIssuePrescription = async (
+    event: React.FormEvent<HTMLFormElement>,
+  ) => {
+    event.preventDefault();
 
-  return (
-    <main className="min-h-full bg-[#f8fbff] px-4 pb-10 pt-4 sm:px-6 lg:px-8">
-      {/* HEADER */}
+    if (!visit || !canEdit) return;
 
-      <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-[#102a56] sm:text-3xl">
-            Patients
-          </h1>
+    const validItems = prescriptionItems.filter(
+      (item) =>
+        item.medicationName.trim() &&
+        item.dosage.trim() &&
+        item.frequency.trim(),
+    );
 
-          <p className="mt-1 text-sm text-slate-500">
-            View and manage your clinical patient roster.
+    if (validItems.length === 0) {
+      setError(
+        "Add at least one medication with a name, dosage and frequency.",
+      );
+      return;
+    }
+
+    setSavingPrescription(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      const items = validItems.map((item) => ({
+        medicationName: item.medicationName.trim(),
+        dosage: item.dosage.trim(),
+        frequency: item.frequency.trim(),
+
+        ...(item.strength.trim()
+          ? { strength: item.strength.trim() }
+          : {}),
+
+        ...(item.route.trim()
+          ? { route: item.route.trim() }
+          : {}),
+
+        ...(item.duration.trim()
+          ? { duration: item.duration.trim() }
+          : {}),
+
+        ...(item.quantity.trim()
+          ? { quantity: Number(item.quantity) }
+          : {}),
+
+        ...(item.instructions.trim()
+          ? { instructions: item.instructions.trim() }
+          : {}),
+
+        refills: item.refills.trim()
+          ? Number(item.refills)
+          : 0,
+      }));
+
+      await apiRequest(
+        `/doctors/me/visits/${visit.id}/prescriptions`,
+        {
+          method: "POST",
+          body: {
+            ...(prescriptionNotes.trim()
+              ? { notes: prescriptionNotes.trim() }
+              : {}),
+            items,
+          },
+        },
+      );
+
+      setPrescriptionNotes("");
+      setPrescriptionItems([
+        { ...EMPTY_PRESCRIPTION_ITEM },
+      ]);
+
+      await loadVisit(visit.id);
+
+      setSuccess("Prescription issued successfully.");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to issue prescription.",
+      );
+    } finally {
+      setSavingPrescription(false);
+    }
+  };
+
+  // ------------------------------------------------------
+  // COMPLETE CONSULTATION
+  // PATCH /doctors/me/visits/:visitId/complete
+  // ------------------------------------------------------
+
+  const handleCompleteConsultation = async () => {
+    if (!visit || !canEdit || !consultation) return;
+
+    const confirmed = window.confirm(
+      "Are you sure you want to complete this consultation? The consultation will no longer be editable.",
+    );
+
+    if (!confirmed) return;
+
+    setCompleting(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      await apiRequest(
+        `/doctors/me/visits/${visit.id}/complete`,
+        {
+          method: "PATCH",
+        },
+      );
+
+      await loadVisit(visit.id);
+
+      setSuccess("Consultation completed successfully.");
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to complete consultation.",
+      );
+    } finally {
+      setCompleting(false);
+    }
+  };
+
+  // ======================================================
+  // LOADING AND ERROR STATES
+  // ======================================================
+
+  if (!isSessionLoaded || loading) {
+    return (
+      <div className="flex min-h-[60vh] items-center justify-center">
+        <div className="text-center">
+          <Loader2
+            className="mx-auto animate-spin text-blue-600"
+            size={34}
+          />
+
+          <p className="mt-4 text-sm text-slate-500">
+            Loading patient consultation...
           </p>
         </div>
+      </div>
+    );
+  }
 
-        <div className="flex flex-wrap items-center gap-3">
+  if (!accessToken) {
+    return (
+      <div className="rounded-2xl border border-amber-200 bg-amber-50 p-6">
+        <p className="font-medium text-amber-900">
+          Your session has expired.
+        </p>
+
+        <p className="mt-1 text-sm text-amber-800">
+          Please log in again to access patient consultations.
+        </p>
+      </div>
+    );
+  }
+
+  if (!visit || !patient) {
+    return (
+      <div className="mx-auto max-w-2xl rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-amber-50 text-amber-600">
+          <AlertCircle size={27} />
+        </div>
+
+        <h2 className="mt-4 text-lg font-semibold text-slate-900">
+          Unable to load patient
+        </h2>
+
+        <p className="mt-2 text-sm leading-6 text-slate-500">
+          {error || "The patient's active assigned visit could not be found."}
+        </p>
+
+        <div className="mt-6 flex justify-center gap-3">
           <button
             type="button"
-            onClick={handleRefresh}
-            disabled={!accessToken || patientsLoading}
-            className="inline-flex items-center justify-center gap-2 rounded-xl border border-blue-100 bg-white px-4 py-3 text-sm font-semibold text-[#54709c] shadow-sm transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={() => router.back()}
+            className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
           >
-            <RefreshCw
-              className={`h-4 w-4 ${
-                patientsLoading ? "animate-spin" : ""
-              }`}
-            />
-            Refresh
+            Go back
           </button>
 
           <button
             type="button"
-            onClick={() =>
-              console.log("Add new patient clicked")
-            }
-            className="inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 focus:outline-none focus:ring-4 focus:ring-blue-100"
+            onClick={() => void loadPatient()}
+            className="flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-700"
           >
-            <Plus className="h-4 w-4" />
-            Add New Patient
+            <RefreshCw size={16} />
+            Try again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ======================================================
+  // MAIN PAGE
+  // ======================================================
+
+  return (
+    <div className="mx-auto max-w-[1500px] space-y-6 pb-10">
+
+      {/* PAGE HEADER */}
+
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <button
+            type="button"
+            onClick={() => router.back()}
+            className="mb-4 inline-flex items-center gap-2 text-sm font-medium text-slate-500 transition hover:text-blue-700"
+          >
+            <ArrowLeft size={16} />
+            Back to patients
+          </button>
+
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+            Patient consultation
+          </h1>
+
+          <p className="mt-1 text-sm text-slate-500">
+            Review patient information, triage results and consultation records.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={`inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold ${getStatusClass(
+              visit.status,
+            )}`}
+          >
+            {formatStatus(visit.status)}
+          </span>
+
+          {visit.isEmergency && (
+            <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-3 py-1.5 text-xs font-semibold text-red-700">
+              <AlertCircle size={14} />
+              Emergency
+            </span>
+          )}
+
+          <button
+            type="button"
+            onClick={() => void loadVisit(visit.id)}
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-50"
+          >
+            <RefreshCw size={15} />
+            Refresh
           </button>
         </div>
       </div>
 
-      {/* DOCTOR AVAILABILITY */}
+      {/* NOTIFICATIONS */}
 
-      <section className="mt-6 rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)] sm:p-6">
-        <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <div className="flex items-center gap-2">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50">
-                <Stethoscope className="h-5 w-5 text-blue-600" />
+      {error && (
+        <div className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+          <AlertCircle className="mt-0.5 shrink-0" size={18} />
+
+          <p>{error}</p>
+
+          <button
+            type="button"
+            onClick={() => setError("")}
+            className="ml-auto text-red-500 hover:text-red-700"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {success && (
+        <div className="flex items-start gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
+          <CheckCircle2 size={18} className="mt-0.5 shrink-0" />
+
+          <p>{success}</p>
+
+          <button
+            type="button"
+            onClick={() => setSuccess("")}
+            className="ml-auto text-emerald-600 hover:text-emerald-800"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* PATIENT OVERVIEW */}
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-center">
+          <div className="flex items-center gap-4">
+            <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-blue-100 text-xl font-bold text-blue-700">
+              {patientInitials}
+            </div>
+
+            <div className="min-w-0">
+              <h2 className="text-xl font-bold text-slate-900">
+                {getPatientName(patient)}
+              </h2>
+
+              <p className="mt-1 text-sm text-slate-500">
+                Patient ID:{" "}
+                <span className="font-semibold text-slate-700">
+                  {patient.patientNumber || "Not recorded"}
+                </span>
+              </p>
+
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">
+                <span>
+                  {patient.sex || "Sex not recorded"}
+                </span>
+
+                <span>
+                  {patient.estimatedAgeYears != null
+                    ? `${patient.estimatedAgeYears} years`
+                    : patient.dateOfBirth
+                      ? formatDate(patient.dateOfBirth)
+                      : "Age not recorded"}
+                </span>
+
+                <span>
+                  {patient.paymentType || "Payment type not recorded"}
+                </span>
               </div>
+            </div>
+          </div>
 
-              <div>
-                <h2 className="font-bold text-[#102a56]">
-                  Doctor Availability
-                </h2>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:min-w-[360px]">
+            <div className="flex items-center gap-3 rounded-xl bg-slate-50 p-3">
+              <Phone size={17} className="text-slate-400" />
 
-                <p className="mt-0.5 text-xs text-slate-400">
-                  Manage your availability to receive patients.
+              <div className="min-w-0">
+                <p className="text-xs text-slate-400">
+                  Phone number
+                </p>
+
+                <p className="truncate text-sm font-medium text-slate-800">
+                  {patient.phone || "Not recorded"}
                 </p>
               </div>
             </div>
 
-            {department && (
-              <p className="mt-3 text-xs font-medium text-slate-500">
-                Department: {department}
-              </p>
-            )}
-          </div>
+            <div className="flex items-center gap-3 rounded-xl bg-slate-50 p-3">
+              <MapPin size={17} className="text-slate-400" />
 
-          {/* AVAILABILITY SELECTOR */}
+              <div className="min-w-0">
+                <p className="text-xs text-slate-400">
+                  Residence
+                </p>
 
-          <div className="relative">
-            <button
-              type="button"
-              disabled={
-                profileLoading ||
-                availabilitySaving ||
-                !accessToken
-              }
-              onClick={() =>
-                setShowAvailabilityOptions(
-                  !showAvailabilityOptions,
-                )
-              }
-              className={`flex w-full items-center justify-between gap-5 rounded-xl border px-4 py-3 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 sm:min-w-[220px] ${currentAvailability.color}`}
-            >
-              <span className="flex items-center gap-2">
-                <span
-                  className={`h-2.5 w-2.5 rounded-full ${currentAvailability.dotColor}`}
-                />
-
-                <span className="text-sm font-semibold">
-                  {profileLoading
-                    ? "Loading..."
-                    : availabilitySaving
-                      ? "Updating..."
-                      : currentAvailability.label}
-                </span>
-              </span>
-
-              <ChevronDown className="h-4 w-4" />
-            </button>
-
-            {showAvailabilityOptions && (
-              <div className="absolute right-0 z-30 mt-2 w-full overflow-hidden rounded-xl border border-blue-100 bg-white p-1 shadow-xl">
-                {availabilityOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    disabled={availabilitySaving}
-                    onClick={() =>
-                      void handleAvailabilityChange(option.value)
-                    }
-                    className="flex w-full items-start gap-3 rounded-lg px-3 py-3 text-left transition hover:bg-blue-50 disabled:opacity-50"
-                  >
-                    <span
-                      className={`mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full ${option.dotColor}`}
-                    />
-
-                    <span className="flex-1">
-                      <span className="block text-sm font-semibold text-[#102a56]">
-                        {option.label}
-                      </span>
-
-                      <span className="mt-0.5 block text-xs text-slate-400">
-                        {option.description}
-                      </span>
-                    </span>
-
-                    {availability === option.value && (
-                      <CheckCircle2 className="h-4 w-4 text-blue-600" />
-                    )}
-                  </button>
-                ))}
+                <p className="truncate text-sm font-medium text-slate-800">
+                  {patient.residence || "Not recorded"}
+                </p>
               </div>
-            )}
+            </div>
           </div>
         </div>
 
-        {/* AVAILABILITY DESCRIPTION */}
-
-        <div className="mt-5 flex items-center gap-3 rounded-xl bg-slate-50 px-4 py-3">
-          <span
-            className={`h-2.5 w-2.5 rounded-full ${currentAvailability.dotColor}`}
+        <div className="mt-5 grid gap-4 border-t border-slate-100 pt-5 sm:grid-cols-2 lg:grid-cols-4">
+          <DetailItem
+            label="Visit number"
+            value={visit.visitNumber}
           />
 
-          <p className="text-sm text-slate-600">
-            {profileLoading
-              ? "Loading your availability..."
-              : currentAvailability.description + "."}
-          </p>
+          <DetailItem
+            label="Visit type"
+            value={visit.visitType}
+          />
+
+          <DetailItem
+            label="Department"
+            value={visit.departmentRef?.name}
+          />
+
+          <DetailItem
+            label="Visit date"
+            value={formatDateTime(visit.createdAt)}
+          />
         </div>
 
-        {/* API SUCCESS MESSAGE */}
+        {visit.reasonForVisit && (
+          <div className="mt-5 rounded-xl bg-blue-50/70 p-4">
+            <p className="text-xs font-semibold uppercase tracking-wide text-blue-600">
+              Reason for visit
+            </p>
 
-        {successMessage && (
-          <div className="mt-3 rounded-xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
-            {successMessage}
-          </div>
-        )}
-
-        {/* API ERROR MESSAGE */}
-
-        {apiError && (
-          <div className="mt-3 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
-            {apiError}
+            <p className="mt-1 text-sm leading-6 text-slate-700">
+              {visit.reasonForVisit}
+            </p>
           </div>
         )}
       </section>
 
-      {/* DOCTOR WORKLOAD STATISTICS */}
+      {/* TRIAGE RESULTS */}
 
-      <section className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {/* WAITING PATIENTS */}
-
-        <div className="rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
-          <div className="flex items-center justify-between">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-50">
-              <Users className="h-5 w-5 text-blue-600" />
-            </div>
-
-            <span className="text-xs font-medium text-slate-400">
-              Waiting
+      <SectionCard
+        title="Triage assessment"
+        description="Clinical observations and measurements recorded by the triage team"
+        icon={HeartPulse}
+        action={
+          triage?.priority ? (
+            <span
+              className={`rounded-full px-3 py-1.5 text-xs font-semibold ring-1 ${getPriorityClass(
+                triage.priority,
+              )}`}
+            >
+              {formatStatus(triage.priority)} priority
             </span>
-          </div>
-
-          <p className="mt-4 text-2xl font-bold text-[#102a56]">
-            {profileLoading ? "..." : waitingPatients}
-          </p>
-
-          <p className="mt-1 text-xs text-slate-400">
-            Patients awaiting consultation
-          </p>
-        </div>
-
-        {/* IN CONSULTATION */}
-
-        <div className="rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
-          <div className="flex items-center justify-between">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-50">
-              <Activity className="h-5 w-5 text-indigo-600" />
-            </div>
-
-            <span className="text-xs font-medium text-slate-400">
-              Active
-            </span>
-          </div>
-
-          <p className="mt-4 text-2xl font-bold text-[#102a56]">
-            {profileLoading ? "..." : patientsInConsultation}
-          </p>
-
-          <p className="mt-1 text-xs text-slate-400">
-            Patients in consultation
-          </p>
-        </div>
-
-        {/* MAXIMUM CAPACITY */}
-
-        <div className="rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
-          <div className="flex items-center justify-between">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-50">
-              <Clock className="h-5 w-5 text-amber-600" />
-            </div>
-
-            <span className="text-xs font-medium text-slate-400">
-              Capacity
-            </span>
-          </div>
-
-          <p className="mt-4 text-2xl font-bold text-[#102a56]">
-            {profileLoading
-              ? "..."
-              : `${currentWorkload}/${maxPatients}`}
-          </p>
-
-          <p className="mt-1 text-xs text-slate-400">
-            Current patient workload
-          </p>
-        </div>
-
-        {/* AVAILABLE SLOTS */}
-
-        <div className="rounded-2xl border border-blue-50 bg-white p-5 shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
-          <div className="flex items-center justify-between">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-50">
-              <UserCheck className="h-5 w-5 text-emerald-600" />
-            </div>
-
-            <span className="text-xs font-medium text-slate-400">
-              Remaining
-            </span>
-          </div>
-
-          <p className="mt-4 text-2xl font-bold text-[#102a56]">
-            {profileLoading ? "..." : remainingCapacity}
-          </p>
-
-          <p className="mt-1 text-xs text-slate-400">
-            Available patient slots
-          </p>
-        </div>
-      </section>
-
-      {/* SEARCH + SCOPE */}
-
-      <div className="mt-6 rounded-2xl border border-blue-50 bg-white p-4 shadow-[0_4px_20px_rgba(37,99,235,0.04)] sm:p-5">
-        <div className="flex flex-col gap-4 xl:flex-row">
-          <div className="relative flex-1">
-            <Search className="absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-[#6680a8]" />
-
-            <input
-              type="search"
-              value={search}
-              onChange={(event) =>
-                handleSearch(event.target.value)
-              }
-              placeholder="Search by name, patient ID, or phone number..."
-              className="h-12 w-full rounded-xl border border-blue-100 bg-white pl-12 pr-4 text-sm text-[#102a56] outline-none transition placeholder:text-slate-400 focus:border-blue-400 focus:ring-4 focus:ring-blue-50"
+          ) : null
+        }
+      >
+        {!triage ? (
+          <div className="rounded-xl border border-dashed border-amber-300 bg-amber-50/60 p-5 text-center">
+            <ShieldAlert
+              className="mx-auto text-amber-600"
+              size={26}
             />
-          </div>
 
-          <div className="flex rounded-xl bg-slate-50 p-1">
-            <button
-              type="button"
-              className="rounded-lg bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm"
-            >
-              My Patients
-            </button>
+            <p className="mt-2 text-sm font-semibold text-amber-900">
+              No triage record found
+            </p>
 
-            <button
-              type="button"
-              disabled
-              title="Doctors can only view patients assigned to them."
-              className="cursor-not-allowed rounded-lg px-5 py-2.5 text-sm font-semibold text-slate-300"
-            >
-              All Patients
-            </button>
-          </div>
-        </div>
-
-        {/* FILTERS */}
-
-        <div className="mt-4 flex flex-wrap gap-2">
-          <div className="relative">
-            <select
-              value={status}
-              onChange={(event) => {
-                setStatus(
-                  event.target.value as PatientStatus | "All",
-                );
-              }}
-              className="appearance-none rounded-lg border border-blue-100 bg-white py-2.5 pl-3 pr-9 text-xs font-medium text-[#54709c] outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50"
-            >
-              <option value="All">All statuses</option>
-              <option value="Admitted">Admitted</option>
-              <option value="Outpatient">Outpatient</option>
-              <option value="Discharged">Discharged</option>
-            </select>
-
-            <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          </div>
-
-          <div className="relative">
-            <select
-              value={gender}
-              onChange={(event) => {
-                setGender(
-                  event.target.value as Gender | "All",
-                );
-              }}
-              className="appearance-none rounded-lg border border-blue-100 bg-white py-2.5 pl-3 pr-9 text-xs font-medium text-[#54709c] outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50"
-            >
-              <option value="All">All genders</option>
-              <option value="Male">Male</option>
-              <option value="Female">Female</option>
-            </select>
-
-            <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          </div>
-
-          <div className="relative">
-            <select
-              value={ageRange}
-              onChange={(event) => {
-                setAgeRange(event.target.value);
-              }}
-              className="appearance-none rounded-lg border border-blue-100 bg-white py-2.5 pl-3 pr-9 text-xs font-medium text-[#54709c] outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50"
-            >
-              <option value="All">All ages</option>
-              <option value="0-17">0–17</option>
-              <option value="18-35">18–35</option>
-              <option value="36-55">36–55</option>
-              <option value="56+">56+</option>
-            </select>
-
-            <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          </div>
-
-          <div className="relative">
-            <select
-              value={sort}
-              onChange={(event) =>
-                setSort(event.target.value as SortMode)
-              }
-              className="appearance-none rounded-lg border border-blue-100 bg-white py-2.5 pl-3 pr-9 text-xs font-medium text-[#54709c] outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50"
-            >
-              <option value="recent">
-                Sort: Recent visit
-              </option>
-              <option value="alphabetical">
-                Sort: Alphabetical
-              </option>
-              <option value="flagged">
-                Sort: Flagged first
-              </option>
-            </select>
-
-            <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-          </div>
-
-          <button
-            type="button"
-            className="inline-flex items-center gap-2 rounded-lg border border-blue-100 px-3 py-2.5 text-xs font-medium text-[#54709c] hover:bg-blue-50"
-          >
-            <SlidersHorizontal className="h-3.5 w-3.5" />
-            More filters
-          </button>
-        </div>
-      </div>
-
-      {/* PATIENT LIST */}
-
-      <section className="mt-5 overflow-hidden rounded-2xl border border-blue-50 bg-white shadow-[0_4px_20px_rgba(37,99,235,0.04)]">
-        <div className="flex items-center justify-between border-b border-blue-50 px-5 py-4 sm:px-6">
-          <div>
-            <h2 className="font-bold text-[#102a56]">
-              My Patients
-            </h2>
-
-            <p className="mt-1 text-xs text-slate-400">
-              {patientsLoading
-                ? "Loading assigned patients..."
-                : `${assignedPatients.length} patients on this page`}
+            <p className="mt-1 text-xs text-amber-800">
+              This visit does not currently have a triage record available.
             </p>
           </div>
-
-          <div className="flex rounded-lg border border-blue-100 p-1">
-            <button
-              type="button"
-              onClick={() => setView("table")}
-              className={`rounded-md p-2 ${
-                view === "table"
-                  ? "bg-blue-50 text-blue-600"
-                  : "text-slate-400"
-              }`}
-              aria-label="Table view"
-            >
-              <List className="h-4 w-4" />
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setView("grid")}
-              className={`rounded-md p-2 ${
-                view === "grid"
-                  ? "bg-blue-50 text-blue-600"
-                  : "text-slate-400"
-              }`}
-              aria-label="Grid view"
-            >
-              <Grid2X2 className="h-4 w-4" />
-            </button>
-          </div>
-        </div>
-
-        {patientsLoading ? (
-          <div className="flex min-h-[350px] flex-col items-center justify-center px-6 text-center">
-            <div className="h-10 w-10 animate-spin rounded-full border-4 border-blue-100 border-t-blue-600" />
-
-            <p className="mt-4 text-sm font-medium text-slate-500">
-              Loading your assigned patients...
-            </p>
-          </div>
-        ) : visiblePatients.length > 0 ? (
-          <>
-            {view === "table" && (
-              <PatientTable patients={visiblePatients} />
-            )}
-
-            {view === "grid" && (
-              <div className="grid grid-cols-1 gap-4 p-4 sm:grid-cols-2 lg:grid-cols-3">
-                {visiblePatients.map((patient) => (
-                  <PatientCard
-                    key={patient.id}
-                    patient={patient}
-                  />
-                ))}
-              </div>
-            )}
-
-            {/* MOBILE CARDS ALWAYS VISIBLE */}
-
-            {view === "table" && (
-              <div className="space-y-3 p-4 lg:hidden">
-                {visiblePatients.map((patient) => (
-                  <PatientCard
-                    key={patient.id}
-                    patient={patient}
-                  />
-                ))}
-              </div>
-            )}
-
-            {/* CURSOR PAGINATION */}
-
-            <div className="flex flex-col gap-3 border-t border-blue-50 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
-              <p className="text-xs text-slate-400">
-                Page {page} · Showing {visiblePatients.length} patients
-              </p>
-
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  disabled={page === 1 || patientsLoading}
-                  onClick={handlePreviousPage}
-                  className="rounded-lg border border-blue-100 px-3 py-2 text-xs font-medium text-[#54709c] disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  Previous
-                </button>
-
-                <span className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white">
-                  {page}
-                </span>
-
-                <button
-                  type="button"
-                  disabled={
-                    !pagination.hasMore ||
-                    !pagination.nextCursor ||
-                    patientsLoading
-                  }
-                  onClick={handleNextPage}
-                  className="rounded-lg border border-blue-100 px-3 py-2 text-xs font-medium text-[#54709c] disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  Next
-                </button>
-              </div>
-            </div>
-          </>
         ) : (
-          <div className="flex min-h-[350px] flex-col items-center justify-center px-6 text-center">
-            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-blue-50">
-              <Search className="h-7 w-7 text-blue-500" />
+          <div className="space-y-5">
+            {/* TRIAGE COMPLAINT */}
+
+            <div className="rounded-xl border border-blue-100 bg-blue-50/60 p-4">
+              <div className="flex items-center gap-2 text-blue-700">
+                <ClipboardList size={17} />
+
+                <h3 className="text-sm font-semibold">
+                  Chief complaint
+                </h3>
+              </div>
+
+              <p className="mt-2 text-sm leading-6 text-slate-700">
+                {triage.chiefComplaint || "No chief complaint recorded."}
+              </p>
             </div>
 
-            <h3 className="mt-4 font-semibold text-[#102a56]">
-              {apiError
-                ? "Unable to load patients"
-                : "No patients found"}
-            </h3>
+            {/* VITAL SIGNS */}
 
-            <p className="mt-2 max-w-sm text-sm text-slate-400">
-              {apiError
-                ? "There was a problem retrieving your assigned patients. Check your connection and try again."
-                : "You currently have no patients assigned to you, or your search and filters returned no results."}
-            </p>
+            <div>
+              <h3 className="mb-3 text-sm font-semibold text-slate-800">
+                Vital signs
+              </h3>
 
-            {apiError && accessToken && (
-              <button
-                type="button"
-                onClick={() =>
-                  void loadAssignedPatients(page, search, currentCursor)
-                }
-                className="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700"
-              >
-                Try Again
-              </button>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4">
+                <VitalCard
+                  label="Temperature"
+                  value={triage.temperature}
+                  unit=" °C"
+                  icon={Activity}
+                />
+
+                <VitalCard
+                  label="Blood pressure"
+                  value={
+                    triage.systolicBP != null &&
+                    triage.diastolicBP != null
+                      ? `${triage.systolicBP}/${triage.diastolicBP}`
+                      : null
+                  }
+                  unit=" mmHg"
+                  icon={HeartPulse}
+                />
+
+                <VitalCard
+                  label="Pulse rate"
+                  value={triage.pulseRate}
+                  unit=" bpm"
+                  icon={Activity}
+                />
+
+                <VitalCard
+                  label="Respiratory rate"
+                  value={triage.respiratoryRate}
+                  unit=" /min"
+                  icon={Activity}
+                />
+
+                <VitalCard
+                  label="Oxygen saturation"
+                  value={triage.oxygenSaturation}
+                  unit=" %"
+                  icon={HeartPulse}
+                />
+
+                <VitalCard
+                  label="Weight"
+                  value={triage.weight}
+                  unit=" kg"
+                  icon={Activity}
+                />
+
+                <VitalCard
+                  label="Height"
+                  value={triage.height}
+                  unit=" cm"
+                  icon={Activity}
+                />
+              </div>
+            </div>
+
+            {/* ALLERGIES AND MEDICATIONS */}
+
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="rounded-xl border border-slate-200 p-4">
+                <h3 className="text-sm font-semibold text-slate-800">
+                  Known allergies
+                </h3>
+
+                <p className="mt-2 text-sm leading-6 text-slate-600">
+                  {displayList(triage.allergies)}
+                </p>
+              </div>
+
+              <div className="rounded-xl border border-slate-200 p-4">
+                <h3 className="text-sm font-semibold text-slate-800">
+                  Current medications
+                </h3>
+
+                <p className="mt-2 text-sm leading-6 text-slate-600">
+                  {displayList(triage.currentMedications)}
+                </p>
+              </div>
+            </div>
+
+            {/* ADDITIONAL NOTES */}
+
+            {triage.additionalNotes && (
+              <div className="rounded-xl border border-slate-200 p-4">
+                <h3 className="text-sm font-semibold text-slate-800">
+                  Additional triage notes
+                </h3>
+
+                <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-600">
+                  {triage.additionalNotes}
+                </p>
+              </div>
             )}
+
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-4 text-xs text-slate-400">
+              <span>
+                Triage recorded: {formatDateTime(triage.recordedAt)}
+              </span>
+
+              <span>
+                Triage record: {triage.id}
+              </span>
+            </div>
+          </div>
+        )}
+      </SectionCard>
+
+      {/* CONSULTATION STATUS AND ACTION */}
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
+          <div>
+            <div className="flex items-center gap-2">
+              <Stethoscope
+                size={20}
+                className="text-blue-700"
+              />
+
+              <h2 className="font-semibold text-slate-900">
+                Doctor consultation
+              </h2>
+            </div>
+
+            <p className="mt-1 text-sm text-slate-500">
+              {isTriaged
+                ? "This patient has been triaged and is ready for consultation."
+                : isWithDoctor
+                  ? "You are currently consulting this patient."
+                  : isCompleted
+                    ? "This consultation has been completed."
+                    : "The patient is not currently ready for consultation."}
+            </p>
+          </div>
+
+          {isTriaged && (
+            <button
+              type="button"
+              onClick={() => void handleStartConsultation()}
+              disabled={starting}
+              className="inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {starting ? (
+                <Loader2 size={17} className="animate-spin" />
+              ) : (
+                <Stethoscope size={17} />
+              )}
+
+              {starting
+                ? "Starting..."
+                : "Start consultation"}
+            </button>
+          )}
+
+          {isWithDoctor && (
+            <span className="inline-flex items-center gap-2 rounded-xl bg-emerald-50 px-4 py-2.5 text-sm font-semibold text-emerald-700">
+              <CheckCircle2 size={17} />
+              Consultation in progress
+            </span>
+          )}
+
+          {isCompleted && (
+            <span className="inline-flex items-center gap-2 rounded-xl bg-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-600">
+              <CheckCircle2 size={17} />
+              Completed
+            </span>
+          )}
+        </div>
+
+        {isTriaged && (
+          <div className="mt-4 rounded-xl border border-blue-100 bg-blue-50/60 p-3 text-sm text-blue-800">
+            <p>
+              Review the triage results above, then select{" "}
+              <strong>Start consultation</strong> to begin recording your clinical findings.
+            </p>
           </div>
         )}
       </section>
-    </main>
+
+      {/* CONSULTATION FORM */}
+
+      {(isWithDoctor || isCompleted) && (
+        <>
+          <SectionCard
+            title="Clinical consultation notes"
+            description="Record your examination, assessment and treatment plan"
+            icon={FileText}
+            action={
+              isCompleted ? (
+                <span className="text-xs font-medium text-slate-500">
+                  Read only
+                </span>
+              ) : null
+            }
+          >
+            <div className="space-y-5">
+              <Field
+                label="Examination findings"
+                value={consultationForm.examinationFindings}
+                onChange={(value) =>
+                  updateConsultationField(
+                    "examinationFindings",
+                    value,
+                  )
+                }
+                placeholder="Record the patient's clinical examination findings..."
+                disabled={!canEdit}
+                rows={4}
+              />
+
+              <Field
+                label="Clinical diagnosis"
+                value={consultationForm.diagnosis}
+                onChange={(value) =>
+                  updateConsultationField("diagnosis", value)
+                }
+                placeholder="Enter the clinical diagnosis..."
+                disabled={!canEdit}
+              />
+
+              <Field
+                label="Diagnosis notes"
+                value={consultationForm.diagnosisNotes}
+                onChange={(value) =>
+                  updateConsultationField(
+                    "diagnosisNotes",
+                    value,
+                  )
+                }
+                placeholder="Additional clinical notes about the diagnosis..."
+                disabled={!canEdit}
+              />
+
+              <Field
+                label="Treatment plan"
+                value={consultationForm.treatmentPlan}
+                onChange={(value) =>
+                  updateConsultationField(
+                    "treatmentPlan",
+                    value,
+                  )
+                }
+                placeholder="Describe the recommended treatment and management..."
+                disabled={!canEdit}
+                rows={4}
+              />
+
+              <Field
+                label="Follow-up instructions"
+                value={consultationForm.followUpInstructions}
+                onChange={(value) =>
+                  updateConsultationField(
+                    "followUpInstructions",
+                    value,
+                  )
+                }
+                placeholder="Record follow-up dates, review instructions and advice..."
+                disabled={!canEdit}
+                rows={3}
+              />
+
+              {canEdit && (
+                <div className="flex justify-end border-t border-slate-100 pt-4">
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveConsultation()}
+                    disabled={savingConsultation}
+                    className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:opacity-60"
+                  >
+                    {savingConsultation ? (
+                      <Loader2
+                        size={16}
+                        className="animate-spin"
+                      />
+                    ) : (
+                      <Save size={16} />
+                    )}
+
+                    {savingConsultation
+                      ? "Saving..."
+                      : "Save consultation"}
+                  </button>
+                </div>
+              )}
+
+              {consultation?.completedAt && (
+                <p className="text-xs text-slate-500">
+                  Completed on {formatDateTime(consultation.completedAt)}
+                </p>
+              )}
+            </div>
+          </SectionCard>
+
+          {/* DIAGNOSES */}
+
+          <SectionCard
+            title="Diagnoses"
+            description="Clinical diagnoses recorded for this visit"
+            icon={ClipboardList}
+          >
+            <div className="space-y-4">
+              {consultation?.diagnoses &&
+              consultation.diagnoses.length > 0 ? (
+                <div className="space-y-3">
+                  {consultation.diagnoses.map((diagnosis) => (
+                    <div
+                      key={diagnosis.id}
+                      className="rounded-xl border border-slate-200 p-4"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h3 className="font-semibold text-slate-900">
+                          {diagnosis.description}
+                        </h3>
+
+                        {diagnosis.diagnosisType && (
+                          <span
+                            className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                              diagnosis.diagnosisType === "PRIMARY"
+                                ? "bg-blue-50 text-blue-700"
+                                : "bg-slate-100 text-slate-600"
+                            }`}
+                          >
+                            {formatStatus(diagnosis.diagnosisType)}
+                          </span>
+                        )}
+                      </div>
+
+                      {diagnosis.code && (
+                        <p className="mt-1 text-xs text-slate-500">
+                          Code: {diagnosis.code}
+                        </p>
+                      )}
+
+                      {diagnosis.notes && (
+                        <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-600">
+                          {diagnosis.notes}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="rounded-xl bg-slate-50 p-4 text-sm text-slate-500">
+                  No additional diagnoses have been recorded.
+                </p>
+              )}
+
+              {canEdit && (
+                <form
+                  onSubmit={handleAddDiagnosis}
+                  className="space-y-4 rounded-xl border border-slate-200 bg-slate-50/60 p-4"
+                >
+                  <h3 className="text-sm font-semibold text-slate-800">
+                    Add a diagnosis
+                  </h3>
+
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <InputField
+                      label="Diagnosis code (optional)"
+                      value={diagnosisForm.code}
+                      onChange={(value) =>
+                        setDiagnosisForm((current) => ({
+                          ...current,
+                          code: value,
+                        }))
+                      }
+                      placeholder="e.g. J06.9"
+                    />
+
+                    <label className="block">
+                      <span className="mb-2 block text-sm font-medium text-slate-700">
+                        Diagnosis type
+                      </span>
+
+                      <select
+                        value={diagnosisForm.diagnosisType}
+                        onChange={(event) =>
+                          setDiagnosisForm((current) => ({
+                            ...current,
+                            diagnosisType: event.target.value as DiagnosisType,
+                          }))
+                        }
+                        className="w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-50"
+                      >
+                        <option value="PRIMARY">
+                          Primary
+                        </option>
+
+                        <option value="SECONDARY">
+                          Secondary
+                        </option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <InputField
+                    label="Diagnosis description"
+                    value={diagnosisForm.description}
+                    onChange={(value) =>
+                      setDiagnosisForm((current) => ({
+                        ...current,
+                        description: value,
+                      }))
+                    }
+                    placeholder="Enter the diagnosis"
+                  />
+
+                  <Field
+                    label="Notes (optional)"
+                    value={diagnosisForm.notes}
+                    onChange={(value) =>
+                      setDiagnosisForm((current) => ({
+                        ...current,
+                        notes: value,
+                      }))
+                    }
+                    placeholder="Additional diagnosis notes..."
+                    rows={2}
+                  />
+
+                  <div className="flex justify-end">
+                    <button
+                      type="submit"
+                      disabled={savingDiagnosis}
+                      className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
+                    >
+                      {savingDiagnosis ? (
+                        <Loader2
+                          size={16}
+                          className="animate-spin"
+                        />
+                      ) : (
+                        <Plus size={16} />
+                      )}
+
+                      Add diagnosis
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+          </SectionCard>
+
+          {/* PRESCRIPTIONS */}
+
+          <SectionCard
+            title="Prescriptions"
+            description="Medication orders issued during this consultation"
+            icon={Pill}
+          >
+            <div className="space-y-4">
+              {consultation?.prescriptions &&
+              consultation.prescriptions.length > 0 ? (
+                <div className="space-y-4">
+                  {consultation.prescriptions.map((prescription) => (
+                    <div
+                      key={prescription.id}
+                      className="overflow-hidden rounded-xl border border-slate-200"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 bg-slate-50 px-4 py-3">
+                        <div>
+                          <p className="text-sm font-semibold text-slate-800">
+                            Prescription
+                          </p>
+
+                          <p className="mt-0.5 text-xs text-slate-500">
+                            {formatDateTime(prescription.prescribedAt)}
+                          </p>
+                        </div>
+
+                        {prescription.status && (
+                          <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
+                            {formatStatus(prescription.status)}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="divide-y divide-slate-100">
+                        {prescription.items?.map((item) => (
+                          <div
+                            key={item.id}
+                            className="p-4"
+                          >
+                            <div className="flex flex-wrap items-start justify-between gap-2">
+                              <div>
+                                <p className="font-semibold text-slate-900">
+                                  {item.medicationName}
+                                </p>
+
+                                {item.strength && (
+                                  <p className="mt-0.5 text-xs text-slate-500">
+                                    {item.strength}
+                                  </p>
+                                )}
+                              </div>
+
+                              {item.quantity != null && (
+                                <span className="text-xs text-slate-500">
+                                  Quantity: {item.quantity}
+                                </span>
+                              )}
+                            </div>
+
+                            <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+                              <DetailItem
+                                label="Dosage"
+                                value={item.dosage}
+                              />
+
+                              <DetailItem
+                                label="Route"
+                                value={item.route}
+                              />
+
+                              <DetailItem
+                                label="Frequency"
+                                value={item.frequency}
+                              />
+
+                              <DetailItem
+                                label="Duration"
+                                value={item.duration}
+                              />
+                            </div>
+
+                            {item.instructions && (
+                              <p className="mt-3 text-sm text-slate-600">
+                                Instructions: {item.instructions}
+                              </p>
+                            )}
+
+                            <p className="mt-2 text-xs text-slate-500">
+                              Refills: {item.refills ?? 0}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+
+                      {prescription.notes && (
+                        <div className="border-t border-slate-100 bg-slate-50 px-4 py-3">
+                          <p className="text-xs font-semibold text-slate-600">
+                            Prescription notes
+                          </p>
+
+                          <p className="mt-1 whitespace-pre-wrap text-sm text-slate-600">
+                            {prescription.notes}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="rounded-xl bg-slate-50 p-4 text-sm text-slate-500">
+                  No prescriptions have been issued for this consultation.
+                </p>
+              )}
+
+              {canEdit && (
+                <form
+                  onSubmit={handleIssuePrescription}
+                  className="space-y-5 rounded-xl border border-slate-200 bg-slate-50/60 p-4"
+                >
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-800">
+                      Issue a prescription
+                    </h3>
+
+                    <p className="mt-1 text-xs text-slate-500">
+                      Add one or more medication items.
+                    </p>
+                  </div>
+
+                  {prescriptionItems.map((item, index) => (
+                    <div
+                      key={index}
+                      className="space-y-4 rounded-xl border border-slate-200 bg-white p-4"
+                    >
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-semibold text-slate-800">
+                          Medication {index + 1}
+                        </h4>
+
+                        {prescriptionItems.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              removePrescriptionItem(index)
+                            }
+                            className="inline-flex items-center gap-1 text-xs font-medium text-red-600 hover:text-red-700"
+                          >
+                            <Trash2 size={14} />
+                            Remove
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                        <InputField
+                          label="Medication name *"
+                          value={item.medicationName}
+                          onChange={(value) =>
+                            updatePrescriptionItem(
+                              index,
+                              "medicationName",
+                              value,
+                            )
+                          }
+                          placeholder="Medication name"
+                        />
+
+                        <InputField
+                          label="Strength"
+                          value={item.strength}
+                          onChange={(value) =>
+                            updatePrescriptionItem(
+                              index,
+                              "strength",
+                              value,
+                            )
+                          }
+                          placeholder="e.g. 500mg"
+                        />
+
+                        <InputField
+                          label="Dosage *"
+                          value={item.dosage}
+                          onChange={(value) =>
+                            updatePrescriptionItem(
+                              index,
+                              "dosage",
+                              value,
+                            )
+                          }
+                          placeholder="e.g. 1 tablet"
+                        />
+
+                        <InputField
+                          label="Route"
+                          value={item.route}
+                          onChange={(value) =>
+                            updatePrescriptionItem(
+                              index,
+                              "route",
+                              value,
+                            )
+                          }
+                          placeholder="e.g. Oral"
+                        />
+
+                        <InputField
+                          label="Frequency *"
+                          value={item.frequency}
+                          onChange={(value) =>
+                            updatePrescriptionItem(
+                              index,
+                              "frequency",
+                              value,
+                            )
+                          }
+                          placeholder="e.g. Twice daily"
+                        />
+
+                        <InputField
+                          label="Duration"
+                          value={item.duration}
+                          onChange={(value) =>
+                            updatePrescriptionItem(
+                              index,
+                              "duration",
+                              value,
+                            )
+                          }
+                          placeholder="e.g. 5 days"
+                        />
+
+                        <InputField
+                          label="Quantity"
+                          type="number"
+                          value={item.quantity}
+                          onChange={(value) =>
+                            updatePrescriptionItem(
+                              index,
+                              "quantity",
+                              value,
+                            )
+                          }
+                          placeholder="e.g. 10"
+                        />
+
+                        <InputField
+                          label="Refills"
+                          type="number"
+                          value={item.refills}
+                          onChange={(value) =>
+                            updatePrescriptionItem(
+                              index,
+                              "refills",
+                              value,
+                            )
+                          }
+                          placeholder="0"
+                        />
+                      </div>
+
+                      <Field
+                        label="Medication instructions"
+                        value={item.instructions}
+                        onChange={(value) =>
+                          updatePrescriptionItem(
+                            index,
+                            "instructions",
+                            value,
+                          )
+                        }
+                        placeholder="Instructions for the patient..."
+                        rows={2}
+                      />
+                    </div>
+                  ))}
+
+                  <button
+                    type="button"
+                    onClick={addPrescriptionItem}
+                    className="inline-flex items-center gap-2 rounded-xl border border-blue-200 bg-white px-4 py-2.5 text-sm font-semibold text-blue-700 transition hover:bg-blue-50"
+                  >
+                    <Plus size={16} />
+                    Add another medication
+                  </button>
+
+                  <Field
+                    label="Prescription notes"
+                    value={prescriptionNotes}
+                    onChange={setPrescriptionNotes}
+                    placeholder="Additional prescription instructions..."
+                    rows={2}
+                  />
+
+                  <div className="flex justify-end border-t border-slate-200 pt-4">
+                    <button
+                      type="submit"
+                      disabled={savingPrescription}
+                      className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-60"
+                    >
+                      {savingPrescription ? (
+                        <Loader2
+                          size={16}
+                          className="animate-spin"
+                        />
+                      ) : (
+                        <Pill size={16} />
+                      )}
+
+                      {savingPrescription
+                        ? "Issuing..."
+                        : "Issue prescription"}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+          </SectionCard>
+
+          {/* COMPLETE CONSULTATION */}
+
+          <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            {isCompleted ? (
+              <div className="flex items-center gap-3 text-emerald-700">
+                <CheckCircle2 size={22} />
+
+                <div>
+                  <h3 className="font-semibold">
+                    Consultation completed
+                  </h3>
+
+                  <p className="mt-1 text-sm text-slate-500">
+                    This visit was completed on{" "}
+                    {formatDateTime(
+                      consultation?.completedAt ??
+                        visit.completedAt,
+                    )}
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
+                <div>
+                  <h3 className="font-semibold text-slate-900">
+                    Complete consultation
+                  </h3>
+
+                  <p className="mt-1 text-sm text-slate-500">
+                    Save your clinical findings before completing this visit.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    void handleCompleteConsultation()
+                  }
+                  disabled={!consultation || completing}
+                  className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 py-3 text-sm font-semibold text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {completing ? (
+                    <Loader2
+                      size={17}
+                      className="animate-spin"
+                    />
+                  ) : (
+                    <CheckCircle2 size={17} />
+                  )}
+
+                  {completing
+                    ? "Completing..."
+                    : "Complete consultation"}
+                </button>
+              </div>
+            )}
+
+            {!consultation && !isCompleted && (
+              <p className="mt-3 rounded-lg bg-amber-50 p-3 text-xs text-amber-800">
+                Start the consultation before you can complete this visit.
+              </p>
+            )}
+          </section>
+        </>
+      )}
+
+      {/* FOOTER INFORMATION */}
+
+      <div className="flex flex-wrap items-center justify-between gap-3 px-1 text-xs text-slate-400">
+        <span className="flex items-center gap-1.5">
+          <CalendarDays size={13} />
+          Visit: {visit.visitNumber || visit.id}
+        </span>
+
+        <span className="flex items-center gap-1.5">
+          <Clock3 size={13} />
+          Last loaded: {new Date().toLocaleTimeString("en-KE")}
+        </span>
+      </div>
+    </div>
   );
 }
+
+
+
  
 
 

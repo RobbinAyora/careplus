@@ -26,10 +26,15 @@
       "static/chunks/main-app.js",
       "static/chunks/app/(dashboard)/layout.js"
     ],
-    "/(dashboard)/receptionist/appointments/page": [
+    "/(dashboard)/receptionist/register/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
-      "static/chunks/app/(dashboard)/receptionist/appointments/page.js"
+      "static/chunks/app/(dashboard)/receptionist/register/page.js"
+    ],
+    "/(dashboard)/receptionist/visits/page": [
+      "static/chunks/webpack.js",
+      "static/chunks/main-app.js",
+      "static/chunks/app/(dashboard)/receptionist/visits/page.js"
     ],
     "/(dashboard)/doctor/dashboard/page": [
       "static/chunks/webpack.js",
@@ -46,15 +51,10 @@
       "static/chunks/main-app.js",
       "static/chunks/app/(dashboard)/doctor/patients/page.js"
     ],
-    "/(dashboard)/receptionist/register/page": [
+    "/(dashboard)/doctor/patients/[patientId]/page": [
       "static/chunks/webpack.js",
       "static/chunks/main-app.js",
-      "static/chunks/app/(dashboard)/receptionist/register/page.js"
-    ],
-    "/(dashboard)/receptionist/visits/page": [
-      "static/chunks/webpack.js",
-      "static/chunks/main-app.js",
-      "static/chunks/app/(dashboard)/receptionist/visits/page.js"
+      "static/chunks/app/(dashboard)/doctor/patients/[patientId]/page.js"
     ],
     "/_not-found/page": [
       "static/chunks/webpack.js",
